@@ -138,7 +138,7 @@ SUBTITLE_COLOR = '#FFFF00' # Yellow
 SUBTITLE_BG_COLOR = 'rgba(0, 0, 0, 0.6)' # Semi-transparent black
 st.set_page_config(layout="wide", page_title="YouTube Video Generator", page_icon="🎥")
 SCRIPT_VER_OPTIONS =create_combos(["default", "default_v2", "1st_person" ])
-BG_VER_OPTIONS =[True, False, "mix"]
+BG_VER_OPTIONS =[ False,"sunrise","funk","ukulele", "mix"]
 TTS_VOICE_OPTIONS = create_combos(['sage','redneck','announcer','sage uk','announcer uk'])
 # --- Load Secrets ---
 try:
@@ -1651,8 +1651,15 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
         combined_audio = tts_audio # Default
         if with_music:
             try:
+                music_path_map ={ "sunrise" : "Sunrise.mp3",
+                                  "ukulele" : "ukulele.mp3",
+                                  "funk" : "funk.mp3"}
+
+
+                
+
                 # Ensure audio file exists relative to the script or provide full path
-                music_path = os.path.join('audio', 'Sunrise.mp3') # Assuming 'audio' subfolder
+                music_path = os.path.join('audio', music_path_map[with_music]) # Assuming 'audio' subfolder
                 if os.path.exists(music_path):
                     back_music = AudioFileClip(music_path).fx(afx.volumex, 0.08)
                     # Ensure music duration matches audio duration (loop or cut)
@@ -1930,7 +1937,7 @@ def sync_search_data():
             current_df = st.session_state.search_data_snapshot.copy()
         else:
             # Fallback: use current state, but this might contain unsynced changes
-            current_df = st.session_state.search_data.copy() if isinstance(st.session_state.search_data, pd.DataFrame) else pd.DataFrame([{'Topic': '', 'Language': 'English','Search Term': '',  "Script Angle": "default", 'Video Results': 5, 'BG Music' : False, 'TTS Voice': 'sage'}])
+            current_df = st.session_state.search_data.copy() if isinstance(st.session_state.search_data, pd.DataFrame) else pd.DataFrame([{'Topic': '', 'Language': 'English','Search Term': '',  "Script Angle": "default", 'Video Results': 5, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}])
 
         # Apply deletions first (indices are based on the snapshot)
         valid_delete_indices = sorted([idx for idx in deleted_rows if idx < len(current_df)], reverse=True)
@@ -2006,7 +2013,7 @@ def sync_search_data():
 
         # If empty after filtering, add back a default row
         if current_df.empty:
-             current_df = pd.DataFrame([{'Topic': '',  'Language': 'English','Search Term': '', "Script Angle": "default", 'Video Results': 5, 'BG Music' : False, 'TTS Voice': 'sage'}])
+             current_df = pd.DataFrame([{'Topic': '',  'Language': 'English','Search Term': '', "Script Angle": "default", 'Video Results': 5, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}])
 
         # Update the main session state and create a fresh snapshot
         st.session_state.search_data = current_df.reset_index(drop=True)
@@ -2048,7 +2055,7 @@ if 'api_search_results' not in st.session_state:
 # Input DataFrame for search terms and topics
 if 'search_data' not in st.session_state:
     st.session_state.search_data = pd.DataFrame([
-        {'Topic': 'sofa sale', 'Language': 'English','Search Term': 'auto',  "Script Angle": "default", 'Video Results': 40, 'BG Music' : True, 'TTS Voice': 'sage'}
+        {'Topic': 'sofa sale', 'Language': 'English','Search Term': 'auto',  "Script Angle": "default", 'Video Results': 40, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}
     ])
 # Snapshot for data editor comparison
 if 'search_data_snapshot' not in st.session_state:
@@ -2494,7 +2501,9 @@ if st.session_state.api_search_results:
                                                 original_height = 560
                                                 target_width = 210
                                                 scale = target_width / original_width
-                                                scaled_height = int(original_height * scale)                                            
+                                                scaled_height = int(original_height * scale)  
+                                                # src="https://www.tiktok.com/embed/v2/{video_id}?lang=en-US&referrer=https%3A%2F%2Fapp.onecompiler.com%2F43xy3g8ex_43y3d4ztj%2F" 
+                                                # src="https://www.tiktok.com/embed/v2/{video_id}?flag=creativeCenterConfig&token=567a7e0b41293818d525d57a7f552e8f" 
                                                 iframe_code = f"""
                                                 <!-- Visible wrapper: clips excess space -->
                                                 <div style="width: {target_width}px; height: {scaled_height}px; overflow: hidden;">
@@ -2502,7 +2511,7 @@ if st.session_state.api_search_results:
                                                 <!-- Inner container: real TikTok player size scaled down -->
                                                 <div style="width: {original_width}px; height: {original_height}px; transform: scale({scale}); transform-origin: top left;">
                                                     <iframe 
-                                                    src="https://www.tiktok.com/embed/v2/{video_id}?lang=en-US&referrer=https%3A%2F%2Fapp.onecompiler.com%2F43xy3g8ex_43y3d4ztj%2F" 
+                                                    src="https://www.tiktok.com/embed/v3/{video_id}?lang=en-US&referrer=https%3A%2F%2Fapp.onecompiler.com%2F43xy3g8ex_43y3d4ztj%2F&autoplay=1" 
                                                     allow="autoplay"
                                                     width="100%" 
                                                     height="100%" 
@@ -2899,7 +2908,7 @@ if st.session_state.batch_processing_active and st.session_state.generation_queu
     if video_data and video_data.get('Direct URL') and not video_data.get('yt_dlp_error'):
         processed_count_display = st.session_state.batch_processed_count + 1
         total_count_display = st.session_state.batch_total_count
-        st.header(f"⚙️ Processing Job {processed_count_display}/{total_count_display}: {video_data['Video Title']} (Copy #{video_data.get('Copy Number', '?')} platform {video_data.get('platform' , "na")})")
+        st.header(f"⚙️ Processing Job {processed_count_display}/{total_count_display}: {video_data['Video Title']} (Copy #{video_data.get('Copy Number', '?')} platform {video_data.get('platform' , 'na')})")
         gen_placeholder = st.container() # Container for logs of this specific job run
 
         try:
@@ -3053,7 +3062,7 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                         # --- 4. Process Video ---
                         st.write(f"3/5: Processing base video & adding audio/subtitles...")
                         current_with_music = bg_music
-                        if current_with_music == 'mix': current_with_music = random.choice([True, False])
+                        if current_with_music == 'mix': current_with_music = random.choice(BG_VER_OPTIONS)
 
                         # Pass Direct URL and other necessary data
                         # This function now downloads the direct url, processes, and returns temp output path
