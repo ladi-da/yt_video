@@ -77,6 +77,8 @@ YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3/search"
 MAX_RESULTS_PER_QUERY = 100 # How many results to fetch *per term* from YouTube API
 YT_DLP_FETCH_TIMEOUT = 30 # Increased timeout for potentially slower connections
 DEFAULT_TTS_VOICE = "sage" # Default voice for TTS
+GOOGLE_TIKTOK_CX_ID = st.secrets.get("GOOGLE_TIKTOK_CX_ID", "331dbbc80d31342af")
+GOOGLE_PINTEREST_CX_ID = st.secrets.get("GOOGLE_PINTEREST_CX_ID", GOOGLE_TIKTOK_CX_ID)
 
 AUTO_TERMS_PROMPT = """You are a Viral Video Ad Scout tasked with finding top YouTube Shorts search terms that reveal
                                                  visually compelling, user-generated content perfect for remixing into high-performing Facebook video ads.
@@ -731,6 +733,17 @@ def search_tiktok_links_google(api_keys, cx_id, query, num_results=20, start_ind
     import time
     from urllib.parse import urlencode
 
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    elif isinstance(api_keys, dict):
+        api_keys = list(api_keys.values())
+    elif isinstance(api_keys, set):
+        api_keys = list(api_keys)
+    api_keys = [key for key in api_keys if key]
+    if not api_keys:
+        st.error("No Google API keys available for TikTok search.", icon="⚠️")
+        return ([], None)
+
     search_query_on_google = f"{query.replace('#','').replace('shorts','')} site:www.tiktok.com/@"
     max_per_page = 10  # Google Custom Search API limit for 'num' is 10
     all_fetched_videos = []
@@ -828,6 +841,110 @@ def search_tiktok_links_google(api_keys, cx_id, query, num_results=20, start_ind
     
     # st.write(f"Returning: {len(all_fetched_videos)} videos, next_page_start_index: {next_page_start_index}") # Debugging
     return (all_fetched_videos, next_page_start_index)
+
+def search_pinterest_links_google(api_keys, cx_id, query, num_results=20, start_index=1, max_retries=6):
+    """
+    Searches for Pinterest pins (video ideas) via Google Custom Search, mirroring the TikTok workflow.
+    Returns (videos_list, next_page_start_index).
+    """
+    import requests
+    import time
+
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    elif isinstance(api_keys, dict):
+        api_keys = list(api_keys.values())
+    elif isinstance(api_keys, set):
+        api_keys = list(api_keys)
+    api_keys = [key for key in api_keys if key]
+    if not api_keys:
+        st.error("No Google API keys available for Pinterest search.", icon="⚠️")
+        return ([], None)
+
+    search_query_on_google = f"""{query.replace('#','').replace('shorts','')} site:www.pinterest.com/pin/ videos/thumbnails """
+    max_per_page = 10
+    all_fetched_videos = []
+    current_start_offset = start_index
+    total_videos_fetched_across_pages = 0
+    next_page_start_index = None
+
+    st.write(f"\nSearching Google for Pinterest pins with: '{search_query_on_google}', wanting {num_results} starting from {start_index}")
+
+    while total_videos_fetched_across_pages < num_results:
+        num_to_fetch_this_page = min(max_per_page, num_results - total_videos_fetched_across_pages)
+        if num_to_fetch_this_page <= 0:
+            break
+
+        tries = 0
+        page_videos = []
+        api_call_succeeded = False
+
+        while tries < max_retries:
+            try:
+                api_key = random.choice(api_keys)
+                params = {
+                    'key': api_key,
+                    'cx': cx_id,
+                    'q': search_query_on_google,
+                    'num': num_to_fetch_this_page,
+                    'start': current_start_offset,
+                    'searchType': 'image',
+                    'gl': 'us'
+                }
+
+                response = requests.get("https://customsearch.googleapis.com/customsearch/v1", params=params, timeout=15)
+                response.raise_for_status()
+                results_data = response.json()
+
+                items_on_page = results_data.get('items', [])
+                for item in items_on_page:
+                    image_block = item.get('image', {})
+                    context_link = image_block.get("contextLink") or item.get("link", "")
+                    if "/pin/" not in context_link:
+                        continue
+                    pin_id = extract_pinterest_pin_id(context_link)
+                    if not pin_id:
+                        continue
+                    thumbnail_url = image_block.get("thumbnailLink") or item.get("link", "")
+                    title = item.get("title", "")
+                    page_videos.append({
+                        'title': title,
+                        'url': context_link,
+                        'thumbnail_url': thumbnail_url,
+                        'videoId': pin_id,
+                        'platform': 'pin'
+                    })
+
+                all_fetched_videos.extend(page_videos)
+                total_videos_fetched_across_pages = len(all_fetched_videos)
+                api_call_succeeded = True
+                break
+
+            except requests.exceptions.RequestException as e:
+                st.warning(f"[Attempt {tries+1}/{max_retries}] Request error for Pinterest start {current_start_offset}: {e}")
+            except Exception as e:
+                st.error(f"Unexpected error for Pinterest start {current_start_offset}: {e}")
+                import traceback
+                st.error(traceback.format_exc())
+
+            tries += 1
+            if tries < max_retries:
+                time.sleep(1)
+
+        if not api_call_succeeded:
+            st.error(f"Failed to fetch data for Pinterest start_index {current_start_offset} after {max_retries} retries.")
+            return (all_fetched_videos, None)
+
+        if len(page_videos) < num_to_fetch_this_page:
+            next_page_start_index = None
+            break
+
+        current_start_offset += num_to_fetch_this_page
+
+    else:
+        next_page_start_index = start_index + total_videos_fetched_across_pages
+
+    return (all_fetched_videos, next_page_start_index)
 # --- Helper Function: Simple Hash ---
 def simple_hash(s):
     """Creates a simple, short hash string from an input string for UI keys."""
@@ -835,6 +952,21 @@ def simple_hash(s):
     for i, c in enumerate(s):
         total += (i + 1) * ord(c)
     return str(total % 100000) # Keep it relatively short
+
+def extract_pinterest_pin_id(url):
+    """Extracts the Pinterest pin ID from a URL."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        segments = [seg for seg in parsed.path.split('/') if seg]
+        for idx, seg in enumerate(segments):
+            if seg.lower() == 'pin' and idx + 1 < len(segments):
+                candidate = segments[idx + 1]
+                break
+        else:
+            candidate = segments[-1] if segments else ""
+        return candidate.split('?')[0].split('&')[0]
+    except Exception:
+        return None
 
 
 # --- Helper Function: Get Info with yt-dlp ---
@@ -1606,11 +1738,13 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
 
             # 2. Load downloaded video with MoviePy
             st.write(f"➡️ Loading downloaded video: {local_vid_path}")
-        if platform == 'tk':
+        elif platform in ('tk', 'pin'):
             # st.text('tk')
             # input()
 
             local_vid_path = download_with_ytdlp(base_video_url)
+            if not local_vid_path:
+                raise ValueError(f"Failed to download base video content from: {base_video_url}")
         # Ensure target_resolution is set for potential resizing during load
         with tempfile.NamedTemporaryFile(delete=False, suffix="_blurred.mp4") as tmp_blur_file:
             blurred_vid_path = tmp_blur_file.name
@@ -2115,6 +2249,7 @@ clear_button = col2.button("🧹 Clear All", use_container_width=True, type="sec
 # with_music_rand = col2.checkbox("With BG music randomly?", value=False)
 is_youtube = col1.checkbox("YT") 
 is_tiktok = col1.checkbox("tk")
+is_pinterest = col1.checkbox("Pin")
 is_blur = col2.checkbox("Blur captions?")
 if clear_button:
     # Reset all relevant states
@@ -2232,194 +2367,220 @@ if st.session_state.search_triggered and 'current_search_df' in st.session_state
     api_error_occurred = False
     results_cache = {} # Temp cache for *this* search run
 
-    for i, item in enumerate(search_items):
-        # Retrieve validated data from the DataFrame row
-        term = item['Search Term'] # Already stripped in sync
-        topic = item['Topic']     # Already stripped in sync
-        count = item['Video Results'] # Already int and clamped
-        lang = item['Language']   # Already stripped in sync
-        script_ver = item["Script Angle"] # Already stripped in sync
-        bg_music = item["BG Music"]
-        tts_voice = item["TTS Voice"]
-        og_term = term
-        # Handle 'auto' search term generation
-        if term.lower() == 'auto':
-            if not topic: # Should be caught by earlier validation, but double-check
-                st.warning(f"Skipping row {i+1}: 'auto' search term requires a Topic.", icon="⚠️")
-                continue
-            status_text_api.text(f"Generating search terms for: '{topic}'...")
-            try:
-                # --- Use the refined GPT prompt for search terms ---
-                # generated_term = chatGPT(f"""You are a viral video ad expert. I will give you a topic, and you will return the top 3 YouTube Shorts search terms that:
+    platform_options_base = []
+    if is_youtube:
+        platform_options_base.append(('yt', "YouTube"))
+    if is_tiktok:
+        platform_options_base.append(('tk', "TikTok"))
+    if is_pinterest:
+        platform_options_base.append(('pin', "Pinterest"))
 
-                #   - Are short (2–5 words)
-
-                #   - Clearly describe what viewers will see in the video (visuals only)
-
-                #   - Lead to emotionally engaging, surprising, or curiosity-triggering content
-
-                #   - Are perfect for remixing or using as inspiration for Facebook video ads
-
-                #   - Focus on things like transformations, objects in motion, satisfying actions, luxury aesthetics, clever space-saving, or unexpected reveals
-
-                #   - Avoid abstract or advice-based phrases (like “tips,” “hacks,” or “secrets”)
-
-                #   - Avoid using non visual\describing words that are not likely to be relevent (like 'On credit', "Financing", etc)
-
-                #   - Add '#shorts' to the end of each search term and separate terms with ' | '
-
-                #   - if the topic is a service (like lawyer) that is intangible, think of something else that can be used (like "Veterans Benefits Lawyer free consultation" give "veteran shares #shorts ")
-
-                #   Example:
-
-                #   Input: sofa
-
-                #   Output:
-
-                #   'sofa transformation #shorts | hidden bed sofa #shorts | luxury sofa unboxing #shorts'
-
-                #   Input: car finance bad credit no deposit
-                #   Output:
-
-                #   'new car tour #shorts | car reaction #shorts | new car surprise #shorts'
-
-                #   My topic:
-
-                # {topic}""", client=openai_client, model="gpt-4") # Use your full validated prompt  
-
-                # generated_term = gemini_text_lib(f"""
-                #                 You are a Viral Video Ad Scout. Your mission is to find YouTube Shorts search terms that uncover visually compelling, user-generated style content perfect for remixing into high-performing Facebook video ads. The key is to think about what *actual users* are likely to upload as Shorts – authentic, engaging moments rather than polished ads.
-
-                #                 Given a topic, return the top 4 YouTube Shorts search terms that meet these criteria 1 of them is the topic itself as consice as possible, the others:
-
-                #                 1.  **Concise & Visual:** 2-3 words, clearly describing *tangible actions, objects, or visual transformations* viewers will see. Focus on the visual verb or noun.
-                #                 2.  **Emotionally Resonant:** Leads to content triggering surprise, satisfaction, curiosity, awe, or joy. Think "wow moments."
-                #                 3.  **Remix-Ready:** Content should be inspiring for new ad creatives, focusing on:
-                #                     * **Transformations:** Before & after, makeovers, redesigns.
-                #                     * **Objects in Motion/Use:** Product demos (organic feel), gadgets in action, vehicles moving.
-                #                     * **Satisfying Processes:** Cleaning, organizing, creating, ASMR-like actions.
-                #                     * **Luxury & Aesthetics:** Unboxings, showcases of high-end items, beautiful setups.
-                #                     * **Clever Solutions:** Space-saving ideas, innovative uses, smart designs.
-                #                     * **Unexpected Reveals:** Hidden features, surprise elements, sudden changes.
-                #                 4.  **Authentic YouTube Style:** Prioritize terms that reflect genuine user uploads, not overly commercial or "how-to" content.
-                #                 5.  **Avoid:**
-                #                     * Abstract concepts, advice-based phrases (e.g., "tips," "hacks," "secrets," "how to learn").
-                #                     * Non-visual qualifiers or descriptive words unlikely to be in a visual search (e.g., "on credit," "financing," "affordable," "best"). The visual should speak for itself.
-                #                 6.  **Handling Intangible Services/Topics:**
-                #                     * If the topic is a service (e.g., lawyer, insurance, software), focus on *visual proxies or relatable human experiences/outcomes* associated with it.
-                #                     * Example: For "Veterans Benefits Lawyer," think about the *result* or *emotion*. Instead of "lawyer consultation," terms like: "veteran disability approved #shorts" or "soldier homecoming surprise #shorts". For software, "dashboard animation #shorts" or "app feature showcase #shorts".
-                #                 7.  **Format:**
-                #                     * Add '#shorts' to the end of each search term.
-                #                     * Separate terms with ' | '.
-
-                #                 Example 1:
-                #                 Input: sofa
-                #                 Output: 'sofa transformation #shorts | hidden storage sofa #shorts | modular sofa setup #shorts| sofa #shorts'
-
-                #                 Example 2:
-                #                 Input: car finance bad credit no deposit
-                #                 Output: 'new car day reaction #shorts | dream car surprise #shorts | first car celebration #shorts | car #shorts'
-
-                #                 Example 3:
-                #                 Input: home cleaning service
-                #                 Output: 'dirty to clean house #shorts | satisfying home clean #shorts | messy room makeover #shorts | home cleaning service #shorts'
-                #                 return just the output no intros or explaining
-                #                 My topic: {topic}
-                #                 """,
-
-                #                 model = "gemini-2.5-flash-preview-04-17"
-                #                 # client=openai_client
-                #                 ) 
-                generated_term= claude(f"""{AUTO_TERMS_PROMPT} {topic}""") #, model ='gemini-2.5-flash-preview-04-17'
-                if not generated_term:
-                    st.warning(f"Failed to generate search terms for '{topic}'. Skipping.", icon="🤖")
+    if not platform_options_base:
+        st.warning("Please select at least one platform before searching.", icon="⚠️")
+        st.session_state.search_triggered = False
+    else:
+        for i, item in enumerate(search_items):
+            # Retrieve validated data from the DataFrame row
+            term = item['Search Term'] # Already stripped in sync
+            topic = item['Topic']     # Already stripped in sync
+            count = item['Video Results'] # Already int and clamped
+            lang = item['Language']   # Already stripped in sync
+            script_ver = item["Script Angle"] # Already stripped in sync
+            bg_music = item["BG Music"]
+            tts_voice = item["TTS Voice"]
+            og_term = term
+            # Handle 'auto' search term generation
+            if term.lower() == 'auto':
+                if not topic: # Should be caught by earlier validation, but double-check
+                    st.warning(f"Skipping row {i+1}: 'auto' search term requires a Topic.", icon="⚠️")
                     continue
-                term = generated_term # Replace 'auto' with generated terms
-                st.write(f"Generated terms for '{topic}': {term}")
-            except Exception as gpt_err:
-                st.error(f"Error generating search terms for '{topic}': {gpt_err}", icon="🤖")
-                continue
-
-        # Proceed with search using the original or generated term
-        status_text_api.text(f"Searching YouTube for: '{term}' (Topic: '{topic}')...")
-        # Key for caching results of this specific search combination
-        unique_search_key = f"{term}_{topic}_{lang}_{script_ver}"
-
-        if unique_search_key not in results_cache:
-            # Pass MAX_RESULTS_PER_QUERY defined earlier
-            if is_youtube:
-                videos = search_youtube(youtube_api_key_secret, term, count)
-
-            elif is_tiktok:
-                # search_tiktok_links_google now returns (videos_list, next_page_start_index)
-                # For the initial search, start_index is 1.
-                # 'count' is item['Video Results'] which is the total num_results desired for this query.
-                videos_list, next_block_start_index = search_tiktok_links_google(
-                    api_keys=youtube_api_key_secret,
-                    cx_id="331dbbc80d31342af",
-                    query=term,
-                    num_results=count, # Total results desired for this topic
-                    start_index=1      # Initial search always starts at 1
-                )
-                videos = videos_list # Assign to 'videos' for consistency with YT path & subsequent logic
-
-            if videos is None: # Indicates a critical API error during fetching by the search function
-                 st.error(f"Stopping search due to critical API issue (videos is None).", icon="🚫")
-                 api_error_occurred = True
-                 break
-
-            # Store results
-            if is_youtube:
-                platform = "yt"
-                results_cache[unique_search_key] = {
-                    'videos': videos,
-                    'topic': topic,
-                    'lang': lang,
-                    "script_ver": script_ver,
-                    'original_term': term,
-                    'bg_music': bg_music,
-                    'original_input_count': count,
-                    'tts_voice': tts_voice,
-                    'input_search_term': og_term,
-                    'platform': platform
-                }
-            elif is_tiktok:
-                platform = 'tk'
-                # For TikTok, calculate num_fetched_results and next_start_index
-                num_fetched_results = len(videos) if videos else 0
-                start_index_used_for_the_call = 1 # For initial search, this is 1
+                status_text_api.text(f"Generating search terms for: '{topic}'...")
+                try:
+                    # --- Use the refined GPT prompt for search terms ---
+                    # generated_term = chatGPT(f"""You are a viral video ad expert. I will give you a topic, and you will return the top 3 YouTube Shorts search terms that:
+    
+                    #   - Are short (2–5 words)
+    
+                    #   - Clearly describe what viewers will see in the video (visuals only)
+    
+                    #   - Lead to emotionally engaging, surprising, or curiosity-triggering content
+    
+                    #   - Are perfect for remixing or using as inspiration for Facebook video ads
+    
+                    #   - Focus on things like transformations, objects in motion, satisfying actions, luxury aesthetics, clever space-saving, or unexpected reveals
+    
+                    #   - Avoid abstract or advice-based phrases (like “tips,” “hacks,” or “secrets”)
+    
+                    #   - Avoid using non visual\describing words that are not likely to be relevent (like 'On credit', "Financing", etc)
+    
+                    #   - Add '#shorts' to the end of each search term and separate terms with ' | '
+    
+                    #   - if the topic is a service (like lawyer) that is intangible, think of something else that can be used (like "Veterans Benefits Lawyer free consultation" give "veteran shares #shorts ")
+    
+                    #   Example:
+    
+                    #   Input: sofa
+    
+                    #   Output:
+    
+                    #   'sofa transformation #shorts | hidden bed sofa #shorts | luxury sofa unboxing #shorts'
+    
+                    #   Input: car finance bad credit no deposit
+                    #   Output:
+    
+                    #   'new car tour #shorts | car reaction #shorts | new car surprise #shorts'
+    
+                    #   My topic:
+    
+                    # {topic}""", client=openai_client, model="gpt-4") # Use your full validated prompt  
+    
+                    # generated_term = gemini_text_lib(f"""
+                    #                 You are a Viral Video Ad Scout. Your mission is to find YouTube Shorts search terms that uncover visually compelling, user-generated style content perfect for remixing into high-performing Facebook video ads. The key is to think about what *actual users* are likely to upload as Shorts – authentic, engaging moments rather than polished ads.
+    
+                    #                 Given a topic, return the top 4 YouTube Shorts search terms that meet these criteria 1 of them is the topic itself as consice as possible, the others:
+    
+                    #                 1.  **Concise & Visual:** 2-3 words, clearly describing *tangible actions, objects, or visual transformations* viewers will see. Focus on the visual verb or noun.
+                    #                 2.  **Emotionally Resonant:** Leads to content triggering surprise, satisfaction, curiosity, awe, or joy. Think "wow moments."
+                    #                 3.  **Remix-Ready:** Content should be inspiring for new ad creatives, focusing on:
+                    #                     * **Transformations:** Before & after, makeovers, redesigns.
+                    #                     * **Objects in Motion/Use:** Product demos (organic feel), gadgets in action, vehicles moving.
+                    #                     * **Satisfying Processes:** Cleaning, organizing, creating, ASMR-like actions.
+                    #                     * **Luxury & Aesthetics:** Unboxings, showcases of high-end items, beautiful setups.
+                    #                     * **Clever Solutions:** Space-saving ideas, innovative uses, smart designs.
+                    #                     * **Unexpected Reveals:** Hidden features, surprise elements, sudden changes.
+                    #                 4.  **Authentic YouTube Style:** Prioritize terms that reflect genuine user uploads, not overly commercial or "how-to" content.
+                    #                 5.  **Avoid:**
+                    #                     * Abstract concepts, advice-based phrases (e.g., "tips," "hacks," "secrets," "how to learn").
+                    #                     * Non-visual qualifiers or descriptive words unlikely to be in a visual search (e.g., "on credit," "financing," "affordable," "best"). The visual should speak for itself.
+                    #                 6.  **Handling Intangible Services/Topics:**
+                    #                     * If the topic is a service (e.g., lawyer, insurance, software), focus on *visual proxies or relatable human experiences/outcomes* associated with it.
+                    #                     * Example: For "Veterans Benefits Lawyer," think about the *result* or *emotion*. Instead of "lawyer consultation," terms like: "veteran disability approved #shorts" or "soldier homecoming surprise #shorts". For software, "dashboard animation #shorts" or "app feature showcase #shorts".
+                    #                 7.  **Format:**
+                    #                     * Add '#shorts' to the end of each search term.
+                    #                     * Separate terms with ' | '.
+    
+                    #                 Example 1:
+                    #                 Input: sofa
+                    #                 Output: 'sofa transformation #shorts | hidden storage sofa #shorts | modular sofa setup #shorts| sofa #shorts'
+    
+                    #                 Example 2:
+                    #                 Input: car finance bad credit no deposit
+                    #                 Output: 'new car day reaction #shorts | dream car surprise #shorts | first car celebration #shorts | car #shorts'
+    
+                    #                 Example 3:
+                    #                 Input: home cleaning service
+                    #                 Output: 'dirty to clean house #shorts | satisfying home clean #shorts | messy room makeover #shorts | home cleaning service #shorts'
+                    #                 return just the output no intros or explaining
+                    #                 My topic: {topic}
+                    #                 """,
+    
+                    #                 model = "gemini-2.5-flash-preview-04-17"
+                    #                 # client=openai_client
+                    #                 ) 
+                    generated_term= claude(f"""{AUTO_TERMS_PROMPT} {topic}""") #, model ='gemini-2.5-flash-preview-04-17'
+                    if not generated_term:
+                        st.warning(f"Failed to generate search terms for '{topic}'. Skipping.", icon="🤖")
+                        continue
+                    term = generated_term # Replace 'auto' with generated terms
+                    st.write(f"Generated terms for '{topic}': {term}")
+                except Exception as gpt_err:
+                    st.error(f"Error generating search terms for '{topic}': {gpt_err}", icon="🤖")
+                    continue
+    
+            platform_options = platform_options_base
+            platform_used = False
+            for platform_code, platform_label in platform_options:
+                platform_used = True
+                unique_search_key = f"{term}_{topic}_{lang}_{script_ver}_{platform_code}"
+                if unique_search_key in results_cache:
+                    continue
+    
+                status_text_api.text(f"Searching {platform_label} for: '{term}' (Topic: '{topic}')...")
+                videos = None
+                next_block_start_index = None
+    
+                if platform_code == 'yt':
+                    videos = search_youtube(youtube_api_key_secret, term, count)
+                elif platform_code == 'tk':
+                    videos_list, next_block_start_index = search_tiktok_links_google(
+                        api_keys=youtube_api_key_secret,
+                        cx_id=GOOGLE_TIKTOK_CX_ID,
+                        query=term,
+                        num_results=count,
+                        start_index=1
+                    )
+                    videos = videos_list
+                elif platform_code == 'pin':
+                    videos_list, next_block_start_index = search_pinterest_links_google(
+                        api_keys=youtube_api_key_secret,
+                        cx_id=GOOGLE_PINTEREST_CX_ID,
+                        query=term,
+                        num_results=count,
+                        start_index=1,
+                        # videos_only=pin_videos_only
+                    )
+                    videos = videos_list
+    
+                if videos is None:
+                     st.error(f"Stopping search due to critical API issue for {platform_label}.", icon="🚫")
+                     api_error_occurred = True
+                     break
+    
+                if platform_code == 'yt':
+                    results_cache[unique_search_key] = {
+                        'videos': videos,
+                        'topic': topic,
+                        'lang': lang,
+                        "script_ver": script_ver,
+                        'original_term': term,
+                        'bg_music': bg_music,
+                        'original_input_count': count,
+                        'tts_voice': tts_voice,
+                        'input_search_term': og_term,
+                        'platform': 'yt'
+                    }
+                elif platform_code == 'tk':
+                    results_cache[unique_search_key] = {
+                        'videos': videos,
+                        'topic': topic,
+                        'lang': lang,
+                        "script_ver": script_ver,
+                        'original_term': term,
+                        'bg_music': bg_music,
+                        'original_input_count': count,
+                        'tts_voice': tts_voice,
+                        'input_search_term': og_term,
+                        'platform': 'tk',
+                        'next_start_index': next_block_start_index,
+                        'last_start_index': 1
+                    }
+                elif platform_code == 'pin':
+                    results_cache[unique_search_key] = {
+                        'videos': videos,
+                        'topic': topic,
+                        'lang': lang,
+                        "script_ver": script_ver,
+                        'original_term': term,
+                        'bg_music': bg_music,
+                        'original_input_count': count,
+                        'tts_voice': tts_voice,
+                        'input_search_term': og_term,
+                        'platform': 'pin',
+                        'next_start_index': next_block_start_index,
+                        'last_start_index': 1
+                    }
                 
-                # Determine next_start_index
-                # 'count' here is item['Video Results'], which is num_results for search_tiktok_links_google
-                # The search_tiktok_links_google function itself also has a max_per_page (10)
-                # We need to compare num_fetched_results with the number of items *requested* in that single API call,
-                # which is min(count, max_per_page=10) by the search function.
-                requested_in_call = min(count, 10) 
-
-                if num_fetched_results == requested_in_call:
-                    next_start_index = start_index_used_for_the_call + num_fetched_results
-                else:
-                    next_start_index = None # No more results or fewer than requested found
-
-                results_cache[unique_search_key] = {
-                    'videos': videos,
-                    'topic': topic,
-                    'lang': lang,
-                    "script_ver": script_ver,
-                    'original_term': term,
-                    'bg_music': bg_music,
-                    'original_input_count': count, # This is the total count user wants for this topic
-                    'tts_voice': tts_voice,
-                    'input_search_term': og_term,
-                    'platform': platform,
-                    'next_start_index': next_block_start_index, 
-                    'last_start_index': 1 # Initial search used start_index = 1
-                }
-            
-            time.sleep(0.1) # Brief pause
-
+                time.sleep(0.1) # Brief pause
+    
+            if not platform_used:
+                st.warning("Please select at least one platform before searching.", icon="⚠️")
+                api_error_occurred = True
+                break
+    
+            if api_error_occurred:
+                break
+    
         progress_bar.progress((i + 1) / len(search_items))
-        if api_error_occurred: break # Exit loop early if critical error
 
     status_text_api.text("API Search complete." if not api_error_occurred else "API Search halted due to error.")
     st.session_state.api_search_results = results_cache # Update main cache
@@ -2443,7 +2604,7 @@ if st.session_state.api_search_results:
         current_search_terms_for_group_display = result_data['original_term']
         bg_music_for_group = result_data.get('bg_music', False) # Default if not present
         tts_voice_for_group = result_data.get('tts_voice', 'sage') # Default if not present
-        platfrom = result_data.get('platform')
+        platform_for_group = result_data.get('platform', 'yt')
         # These are from the original data editor input for this topic/row
         # Ensure these keys ('input_search_term', 'original_input_count') were stored when api_search_results was populated
         input_search_term_from_editor = result_data.get('input_search_term', current_search_terms_for_group_display)
@@ -2463,7 +2624,7 @@ if st.session_state.api_search_results:
             else:
                 num_videos = len(videos)
                 num_cols = 3 # Adjust number of columns as desired
-                if platfrom == 'tk':
+                if platform_for_group in ('tk', 'pin'):
                     num_cols = 5
 
                 for i in range(0, num_videos, num_cols):
@@ -2483,8 +2644,8 @@ if st.session_state.api_search_results:
                                 show_video_key = f"show_player_{grid_instance_key}"
                                 st.session_state.setdefault(show_video_key, False)
 
-                                st.write(f"**{textwrap.shorten(video_title, width=50, placeholder='...')}**")
-                                st.caption(f"ID: {video_id}")
+                                st.write(f"**{textwrap.shorten(video_title, width=30, placeholder='...')}**")
+                                # st.caption(f"ID: {video_id}")
 
                                 if st.session_state[show_video_key]:
                                     try:
@@ -2496,7 +2657,7 @@ if st.session_state.api_search_results:
                                             allow="accelerometer; autoplay; clipboard-write; encrypted-media;
                                             gyroscope; picture-in-picture; web-share"
                                             allowfullscreen></iframe>"""
-                                        if platform == 'tk':
+                                        elif platform == 'tk':
                                                 original_width = 300
                                                 original_height = 560
                                                 target_width = 210
@@ -2525,6 +2686,23 @@ if st.session_state.api_search_results:
                                                 </div>
 
                                                 """
+                                        elif platform == 'pin':
+                                                target_width = 236
+                                                target_height = 420
+                                                video_id_markdown =  video_id.split("-")[-1]
+                                                iframe_code = f"""
+                                                <div style="width:{target_width}px; margin:auto;">
+                                                    <iframe 
+                                                        src="https://assets.pinterest.com/ext/embed.html?id={video_id_markdown}"
+                                                        height="{target_height}"
+                                                        width="{target_width}"
+                                                        frameborder="0"
+                                                        scrolling="no"
+                                                        loading="lazy"
+                                                        style="border-radius:12px;">
+                                                    </iframe>
+                                                </div>
+                                                """
 #                                                 iframe_code = f"""
 #                                             <iframe 
 #                                             height="400" 
@@ -2551,14 +2729,13 @@ if st.session_state.api_search_results:
                                 else:
                                     if platform == 'yt':
                                         thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
-
-                                    if platform == 'tk':
-                                        thumbnail_url = thumbnail
+                                    elif platform in ('tk', 'pin'):
+                                        thumbnail_url = thumbnail or standard_video_url
 
                                     try:
                                         if platform == 'yt':
                                             st.image(thumbnail_url, use_container_width=False, caption="Video Thumbnail",width=200)
-                                        if platform == 'tk':
+                                        elif platform in ('tk', 'pin'):
                                           # st.image(thumbnail, caption="Video Thumbnail",width = "stretch")
                                           st.markdown(
                                                             f"""
@@ -2661,23 +2838,27 @@ if st.session_state.api_search_results:
                                                 else: st.write(f"Status: {status}")
             # --- End of Video Grid Display ---
 
-            # --- "Show More TikTok Results" Button ---
-            if platfrom == 'tk' and result_data.get('next_start_index') is not None:
+            # --- "Show More" Button (TikTok/Pinterest) ---
+            if platform_for_group in ('tk', 'pin') and result_data.get('next_start_index') is not None:
                 current_next_start_index = result_data.get('next_start_index')
                 requested_batch_size = result_data.get('original_input_count', 10) # Get the batch size for the label
+                
+                platform_label = "TikTok" if platform_for_group == 'tk' else "Pinterest"
+                fetch_fn = search_tiktok_links_google if platform_for_group == 'tk' else search_pinterest_links_google
+                cx_id_for_platform = GOOGLE_TIKTOK_CX_ID if platform_for_group == 'tk' else GOOGLE_PINTEREST_CX_ID
 
-                if st.button(f"Show More {requested_batch_size} TikTok Results", key=f"show_more_tk_{search_key}", use_container_width=True):
+                if st.button(f"Show More {requested_batch_size} {platform_label} Results", key=f"show_more_{platform_for_group}_{search_key}", use_container_width=True):
                     if current_next_start_index: # Ensure it's not None one last time
                         # Retrieve necessary data from result_data for the API call
                         original_query_term = result_data.get('original_term')
                         # original_input_count is the total num_results user wants for this topic/search_key
                         total_results_desired_for_topic = result_data.get('original_input_count', 10) 
                         
-                        with st.spinner(f"Fetching more TikTok results for '{original_query_term}'..."):
+                        with st.spinner(f"Fetching more {platform_label} results for '{original_query_term}'..."):
                             # current_next_start_index is where the *next block* of results should start
-                            new_videos_block, new_block_next_start_index = search_tiktok_links_google(
+                            new_videos_block, new_block_next_start_index = fetch_fn(
                                 api_keys=youtube_api_key_secret,
-                                cx_id="331dbbc80d31342af",
+                                cx_id=cx_id_for_platform,
                                 query=original_query_term,
                                 num_results=total_results_desired_for_topic, # Ask for another full block
                                 start_index=current_next_start_index 
@@ -2722,25 +2903,34 @@ if st.session_state.api_search_results:
                             else:
                                 st.write(f"Newly generated terms for '{topic_for_group}': {new_ai_generated_terms}")
                                 # Search YouTube with these NEW terms, using the original count for this topic
-                                if platform == 'yt':
+                                if platform_for_group == 'yt':
                                     new_videos = search_youtube(youtube_api_key_secret, new_ai_generated_terms, count_from_editor)
-                                elif platform == 'tk':
+                                elif platform_for_group == 'tk':
                                     # Call the refactored search_tiktok_links_google
                                     # It now returns (videos_list, next_block_start_index)
                                     # For a new "auto" search, always start at index 1
                                     videos_list, next_block_start_index = search_tiktok_links_google(
                                         api_keys=youtube_api_key_secret,
-                                        cx_id="331dbbc80d31342af",
+                                        cx_id=GOOGLE_TIKTOK_CX_ID,
                                         query=new_ai_generated_terms,
                                         num_results=count_from_editor, # User's desired items per batch
                                         start_index=1 
                                     )
                                     new_videos = videos_list # Keep 'new_videos' name for the common logic below
+                                elif platform_for_group == 'pin':
+                                    videos_list, next_block_start_index = search_pinterest_links_google(
+                                        api_keys=youtube_api_key_secret,
+                                        cx_id=GOOGLE_PINTEREST_CX_ID,
+                                        query=new_ai_generated_terms,
+                                        num_results=count_from_editor,
+                                        start_index=1
+                                    )
+                                    new_videos = videos_list
 
                                 if new_videos is not None: 
                                     st.session_state.api_search_results[search_key]['videos'] = new_videos # Replace with new results
                                     st.session_state.api_search_results[search_key]['original_term'] = new_ai_generated_terms
-                                    if platform == 'tk': # Specific updates for TikTok pagination
+                                    if platform_for_group in ('tk', 'pin'): # Specific updates for pagination platforms
                                         st.session_state.api_search_results[search_key]['next_start_index'] = next_block_start_index
                                         st.session_state.api_search_results[search_key]['last_start_index'] = 1
                                     # For YouTube, 'next_start_index' etc. are not currently used in this 'auto search more' block.
@@ -2778,24 +2968,33 @@ if st.session_state.api_search_results:
                         if new_manual_term:
                             st.info(f"Searching with new term '{new_manual_term}' for topic: {topic_for_group}...")
                             # Search YouTube with the new manual term, using the original count for this topic
-                            if platform == 'yt':
+                            if platform_for_group == 'yt':
                                 new_videos = search_youtube(youtube_api_key_secret, new_manual_term, count_from_editor)
-                            elif platform == 'tk':
+                            elif platform_for_group == 'tk':
                                 # Call the refactored search_tiktok_links_google
                                 # For a new manual search, always start at index 1
                                 videos_list, next_block_start_index = search_tiktok_links_google(
                                     api_keys=youtube_api_key_secret,
-                                    cx_id="331dbbc80d31342af",
+                                    cx_id=GOOGLE_TIKTOK_CX_ID,
                                     query=new_manual_term,
                                     num_results=count_from_editor, # User's desired items per batch
                                     start_index=1
                                 )
                                 new_videos = videos_list # Keep 'new_videos' name for common logic
+                            elif platform_for_group == 'pin':
+                                videos_list, next_block_start_index = search_pinterest_links_google(
+                                    api_keys=youtube_api_key_secret,
+                                    cx_id=GOOGLE_PINTEREST_CX_ID,
+                                    query=new_manual_term,
+                                    num_results=count_from_editor,
+                                    start_index=1
+                                )
+                                new_videos = videos_list
 
                             if new_videos is not None:
                                 st.session_state.api_search_results[search_key]['videos'] = new_videos # Replace with new results
                                 st.session_state.api_search_results[search_key]['original_term'] = new_manual_term
-                                if platform == 'tk': # Specific updates for TikTok pagination
+                                if platform_for_group in ('tk', 'pin'): # Specific updates for pagination
                                     st.session_state.api_search_results[search_key]['next_start_index'] = next_block_start_index
                                     st.session_state.api_search_results[search_key]['last_start_index'] = 1
                                 # Similar to 'auto search more', YT doesn't use these pagination fields in this block yet.
@@ -2842,7 +3041,7 @@ if not st.session_state.batch_processing_active:
             platform = video_data.get('platform')
 
 
-            if platform =='tk':
+            if platform in ('tk','pin'):
                 current_state = st.session_state.selected_videos.get(fetch_job_key)
                 current_state['fetching_dlp'] = False
                 current_state['Direct URL'] = standard_url
