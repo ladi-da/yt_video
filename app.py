@@ -474,62 +474,84 @@ def blur_subtitles_in_video_unified(
 
 
 
-def create_topic_summary_dataframe(selected_videos_dict):
+def create_topic_summary_dataframe(selected_videos_dict, input_df=None):
     """
     Creates a DataFrame summarizing generated videos grouped by a normalized
-    'topic_language' key.
+    'topic_language' key. When an input table is provided, ensure that every
+    topic row (even ones requesting a count of zero) appears in the same order
+    with blank URL slots.
     """
+
+    def _normalize_topic_lang(topic_val, lang_val):
+        topic_clean = str(topic_val or '').strip().lower()
+        lang_clean = str(lang_val or '').strip().lower()
+        if not topic_clean or not lang_clean:
+            return None
+        return f"{topic_clean}_{lang_clean}"
+
     topic_lang_to_generated_urls = {}
 
     # 1. Collect Generated URLs and Group by Normalized Topic + Language
     for job_key, video_data in selected_videos_dict.items(): # Iterate through job entries
-        topic = str(video_data.get('Topic', '')).strip().lower()
-        lang = str(video_data.get('Language', '')).strip().lower()
+        grouping_key = _normalize_topic_lang(
+            video_data.get('Topic', ''),
+            video_data.get('Language', '')
+        )
         s3_url = video_data.get('Generated S3 URL')
 
-        if topic and lang and s3_url:
-            grouping_key = f"{topic}_{lang}"
-            if grouping_key not in topic_lang_to_generated_urls:
-                topic_lang_to_generated_urls[grouping_key] = []
-            topic_lang_to_generated_urls[grouping_key].append(s3_url)
+        if grouping_key and s3_url:
+            topic_lang_to_generated_urls.setdefault(grouping_key, []).append(s3_url)
 
-    if not topic_lang_to_generated_urls:
+    input_df_valid = isinstance(input_df, pd.DataFrame) and not input_df.empty
+    if not topic_lang_to_generated_urls and not input_df_valid:
         return pd.DataFrame(columns=['Topic'])
 
     # 2. Determine Max URLs per Group and Prepare Data
-    max_urls = 0
-    if topic_lang_to_generated_urls:
-        try:
-            max_urls = max(len(urls) for urls in topic_lang_to_generated_urls.values())
-        except ValueError:
-            max_urls = 0 # Handle case where dict becomes empty after filtering
+    max_urls = max(
+        (len(urls) for urls in topic_lang_to_generated_urls.values()),
+        default=0
+    )
 
-    data_for_df = []
-    for topic_lang_key, urls in topic_lang_to_generated_urls.items():
+    def _build_row_for_key(topic_lang_key):
         row = {'Topic': topic_lang_key}
-        # Pad with empty strings if fewer than max_urls for this topic/lang
-        padded_urls = urls + [''] * (max_urls - len(urls))
+        urls = topic_lang_to_generated_urls.get(topic_lang_key, [])
+        padded_urls = urls + [''] * max(0, max_urls - len(urls))
         for i, url in enumerate(padded_urls):
             row[f'vid{i+1}_url'] = url
-        data_for_df.append(row)
+        return row
+
+    data_for_df = []
+    seen_keys = set()
+
+    if input_df_valid:
+        for _, row in input_df.iterrows():
+            grouping_key = _normalize_topic_lang(row.get('Topic', ''), row.get('Language', ''))
+            if not grouping_key or grouping_key in seen_keys:
+                continue
+            seen_keys.add(grouping_key)
+            data_for_df.append(_build_row_for_key(grouping_key))
+
+    for topic_lang_key in topic_lang_to_generated_urls.keys():
+        if topic_lang_key in seen_keys:
+            continue
+        data_for_df.append(_build_row_for_key(topic_lang_key))
 
     # 3. Create Final DataFrame
     if data_for_df:
         df_final = pd.DataFrame(data_for_df)
-        # Ensure 'Topic' column is first and URL columns are sorted
         if 'Topic' in df_final.columns:
-             topic_col = df_final.pop('Topic')
-             df_final.insert(0, 'Topic', topic_col)
-             url_cols_present = [col for col in df_final.columns if col.startswith('vid')]
-             # Sort URL columns numerically
-             url_cols_sorted = sorted(url_cols_present,
-                                      key=lambda x: int(x.replace('vid','').replace('_url','')))
-             df_final = df_final[['Topic'] + url_cols_sorted]
+            topic_col = df_final.pop('Topic')
+            df_final.insert(0, 'Topic', topic_col)
+            url_cols_present = [col for col in df_final.columns if col.startswith('vid')]
+            url_cols_sorted = sorted(
+                url_cols_present,
+                key=lambda x: int(x.replace('vid', '').replace('_url', ''))
+            )
+            df_final = df_final[['Topic'] + url_cols_sorted]
         else:
-             # Fallback if Topic column somehow wasn't created
-             df_final = pd.DataFrame(columns=['Topic'])
+            df_final = pd.DataFrame(columns=['Topic'])
     else:
-         df_final = pd.DataFrame(columns=['Topic'])
+        df_final = pd.DataFrame(columns=['Topic'])
 
     return df_final
 
@@ -2178,12 +2200,19 @@ def sync_search_data():
                       for col in expected_cols:
                            val = row_dict.get(col)
                            # Set defaults or convert type
-                           # if col == "Language": new_row[col] = str(val).strip() if pd.notna(val) and str(val).strip() else "English"
-                           # elif col == "Script Angle": new_row[col] = str(val).strip() if pd.notna(val) and str(val).strip() else "default"
-                           # elif col == "Video Results":
-                           #      try: new_row[col] = int(val) if pd.notna(val) else 5
-                           #      except (ValueError, TypeError): new_row[col] = 5
-                           # else: new_row[col] = str(val).strip() if pd.notna(val) else ""
+                           if col == "Language":
+                                new_row[col] = str(val).strip() if pd.notna(val) and str(val).strip() else "English"
+                           elif col == "Script Angle":
+                                new_row[col] = str(val).strip() if pd.notna(val) and str(val).strip() else "default"
+                           elif col == "Video Results":
+                                try: new_row[col] = int(val) if pd.notna(val) else 5
+                                except (ValueError, TypeError): new_row[col] = 5
+                           elif col == "BG Music":
+                                new_row[col] = val if pd.notna(val) and val != '' else False
+                           elif col == "TTS Voice":
+                                new_row[col] = str(val).strip() if pd.notna(val) and str(val).strip() else "sage"
+                           else:
+                                new_row[col] = str(val).strip() if pd.notna(val) else ""
                       processed_adds.append(new_row)
             if processed_adds:
                  add_df = pd.DataFrame(processed_adds)
@@ -2203,7 +2232,7 @@ def sync_search_data():
         # Type conversion and validation
         try:
             current_df['Video Results'] = pd.to_numeric(current_df['Video Results'], errors='coerce').fillna(5).astype(int)
-            current_df['Video Results'] = current_df['Video Results'].apply(lambda x: max(1, min(x, 100))) # Clamp 1-50
+            current_df['Video Results'] = current_df['Video Results'].apply(lambda x: max(0, min(x, 100))) # Clamp 1-50
         except Exception: current_df['Video Results'] = 5
         current_df['Topic'] = current_df['Topic'].fillna('').astype(str).str.strip()
         current_df['Search Term'] = current_df['Search Term'].fillna('').astype(str).str.strip()
@@ -2296,7 +2325,7 @@ edited_df = st.sidebar.data_editor(
     st.session_state.search_data, # Use the main state data
     column_config={
         "Script Angle": st.column_config.SelectboxColumn("Script Angle", options=SCRIPT_VER_OPTIONS, default="default", required=True),
-        "Video Results": st.column_config.NumberColumn("Video Results", min_value=1, max_value=100, step=1, default=5, required=True),
+        "Video Results": st.column_config.NumberColumn("Video Results", min_value=0, max_value=100, step=1, default=5, required=True),
         "Language": st.column_config.TextColumn("Language", default="English", required=True),
         "Topic": st.column_config.TextColumn("Topic"),
         "Search Term": st.column_config.TextColumn("Search Term (or 'auto')"),
@@ -2463,6 +2492,10 @@ if st.session_state.search_triggered and 'current_search_df' in st.session_state
             bg_music = item["BG Music"]
             tts_voice = item["TTS Voice"]
             og_term = term
+
+            if count <= 0:
+                st.info(f"Skipping row {i+1} ('{topic}' / '{term}') because Video Results is set to 0.", icon="ℹ️")
+                continue
             # Handle 'auto' search term generation
             if term.lower() == 'auto':
                 if not topic: # Should be caught by earlier validation, but double-check
@@ -2599,7 +2632,10 @@ if st.session_state.search_triggered and 'current_search_df' in st.session_state
                      st.error(f"Stopping search due to critical API issue for {platform_label}.", icon="🚫")
                      api_error_occurred = True
                      break
-    
+                if not videos:
+                     st.warning(f"No {platform_label} results for '{term}' (Topic: '{topic}'). Skipping this platform.", icon="⚠️")
+                     continue
+
                 if platform_code == 'yt':
                     results_cache[unique_search_key] = {
                         'videos': videos,
@@ -3416,7 +3452,13 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                 st.balloons()
                 st.success("🎉 Batch processing finished!")
                 if not st.session_state.get("sheet_appended", False):
-                    df_topic_summary = create_topic_summary_dataframe(st.session_state.selected_videos)
+                    input_reference_df = st.session_state.get('current_search_df')
+                    if input_reference_df is None or input_reference_df.empty:
+                        input_reference_df = st.session_state.get('search_data')
+                    df_topic_summary = create_topic_summary_dataframe(
+                        st.session_state.selected_videos,
+                        input_reference_df
+                    )
                     if not df_topic_summary.empty:
                         google_sheets_append_df(
                             "13TOgYTYpVV0ysvKqufS2Q5RDdgTP097x1hH_eMtCL4w",
@@ -3516,7 +3558,13 @@ if 'selected_videos' in st.session_state and st.session_state.selected_videos:
         # --- Topic Summary DataFrame Section ---
         st.sidebar.divider()
         st.sidebar.subheader("Generated Video Summary by Topic")
-        df_topic_summary = create_topic_summary_dataframe(st.session_state.selected_videos)
+        input_reference_df = st.session_state.get('current_search_df')
+        if input_reference_df is None or input_reference_df.empty:
+            input_reference_df = st.session_state.get('search_data')
+        df_topic_summary = create_topic_summary_dataframe(
+            st.session_state.selected_videos,
+            input_reference_df
+        )
 
         if not df_topic_summary.empty:
             st.sidebar.dataframe(
