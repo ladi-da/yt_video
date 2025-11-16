@@ -1186,7 +1186,7 @@ def chatGPT(prompt, client, model="gpt-4o", temperature=1.0):
 
 
 # --- Helper Function: Generate Script with Claude ---
-def claude(prompt , model = "claude-3-7-sonnet-20250219", temperature=1 , is_thinking = False, max_retries = 10):
+def claude(prompt , model = "claude-sonnet-4-0", temperature=1 , is_thinking = False, max_retries = 10):
     tries = 0
 
     while tries < max_retries:
