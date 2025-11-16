@@ -142,7 +142,10 @@ st.set_page_config(layout="wide", page_title="YouTube Video Generator", page_ico
 SCRIPT_VER_OPTIONS =create_combos(["default", "default_v2", "1st_person" ])
 BG_VER_OPTIONS =[ False,"sunrise","funk","ukulele", "mix"]
 TTS_VOICE_OPTIONS = create_combos(['sage','redneck','announcer','sage uk','announcer uk'])
+# Consistent Backblaze path for generated creatives
+S3_VIDSLIDE_PREFIX = "creative-cloud/vidslide"
 # --- Load Secrets ---
+s3_endpoint_url = st.secrets.get("S3_ENDPOINT_URL")
 try:
     GEMINI_API_KEY =st.secrets.get("GEMINI_API_KEY")
 
@@ -176,7 +179,8 @@ def get_s3_client():
             's3',
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key,
-            region_name=s3_region
+            region_name=s3_region,
+            endpoint_url=s3_endpoint_url.strip() if s3_endpoint_url else None
         )
     except NoCredentialsError:
         st.error("AWS Credentials not found or invalid in secrets.", icon="🚨")
@@ -2012,7 +2016,68 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
 
 
 # --- Helper Function: Upload Video to S3 ---
-def upload_vid_to_s3(s3_cli, video_path, bucket_name, object_name, region_name):
+def upload_pil_image_to_s3(
+    image,
+    bucket_name,
+    aws_access_key_id,
+    aws_secret_access_key,
+    object_name="",
+    region_name=None,
+    endpoint_url=None,
+    image_format="JPEG",
+):
+    """Upload a PIL image to any S3-compatible bucket (Backblaze B2)."""
+    clean_region = region_name.strip() if region_name else None
+    clean_endpoint = endpoint_url.strip() if endpoint_url else None
+    bucket = bucket_name.strip() if bucket_name else ""
+    if not bucket:
+        st.error("Bucket name is required for image upload.", icon="🪣")
+        return None
+    if not aws_access_key_id or not aws_secret_access_key:
+        st.error("AWS credentials not available for image upload.", icon="🔑")
+        return None
+
+    try:
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=aws_access_key_id.strip(),
+            aws_secret_access_key=aws_secret_access_key.strip(),
+            region_name=clean_region,
+            endpoint_url=clean_endpoint,
+        )
+    except Exception as e:
+        st.error(f"Failed to initialize S3 client for image upload: {e}", icon="🚨")
+        return None
+
+    if not object_name:
+        object_name = f"image_{int(time.time())}_{random.randint(1000, 9999)}.{image_format.lower()}"
+    object_key = object_name.lstrip("/")
+
+    img_byte_arr = BytesIO()
+    image.save(img_byte_arr, format=image_format.upper(), quality=90)
+    img_byte_arr.seek(0)
+
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=object_key,
+            Body=img_byte_arr,
+            ContentType=f"image/{image_format.lower()}",
+        )
+    except Exception as e:
+        st.error(f"S3 image upload failed: {e}", icon="🖼️")
+        return None
+
+    safe_object_name = urllib.parse.quote(object_key, safe="/")
+    if clean_endpoint:
+        return f"{clean_endpoint.rstrip('/')}/{bucket}/{safe_object_name}"
+    region_segment = clean_region or "us-east-1"
+    if region_segment == 'us-east-1':
+        return f"https://{bucket}.s3.amazonaws.com/{safe_object_name}"
+    return f"https://{bucket}.s3.{region_segment}.amazonaws.com/{safe_object_name}"
+
+
+def upload_vid_to_s3(s3_cli, video_path, bucket_name, object_name, region_name, endpoint_url=None):
     """Uploads a video file to S3."""
     if not s3_cli:
         st.error("S3 Client not initialized. Cannot upload.", icon="🚫")
@@ -2024,25 +2089,34 @@ def upload_vid_to_s3(s3_cli, video_path, bucket_name, object_name, region_name):
         st.error(f"Video file is empty, cannot upload: {video_path}", icon="⚠️")
         return None
 
+    clean_region = region_name.strip() if isinstance(region_name, str) else region_name
+    clean_endpoint = endpoint_url.strip() if endpoint_url else None
+    bucket = bucket_name.strip() if isinstance(bucket_name, str) else bucket_name
+    object_key = object_name.lstrip("/") if isinstance(object_name, str) else object_name
+
     st.write(f"☁️ Uploading '{object_name}' to S3 bucket '{bucket_name}'...")
     try:
         with open(video_path, "rb") as video_file:
             s3_cli.put_object(
-                Bucket=bucket_name,
-                Key=object_name,
+                Bucket=bucket,
+                Key=object_key,
                 Body=video_file,
                 ContentType='video/mp4' # Ensure correct MIME type
             )
 
         # Construct the S3 URL (ensure object_name is URL-encoded)
-        safe_object_name = urllib.parse.quote(object_name)
-        if region_name == 'us-east-1':
-             # us-east-1 URL format might differ (no region needed or optional)
-             # Check S3 documentation or common practice. Using the format without region is often safe.
-             video_url = f"https://{bucket_name}.s3.amazonaws.com/{safe_object_name}"
-             # Alternate: f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{safe_object_name}"
+        safe_object_name = urllib.parse.quote(object_key, safe="/")
+        if clean_endpoint:
+            video_url = f"{clean_endpoint.rstrip('/')}/{bucket}/{safe_object_name}"
         else:
-             video_url = f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{safe_object_name}"
+            region_segment = clean_region or 'us-east-1'
+            if region_segment == 'us-east-1':
+                 # us-east-1 URL format might differ (no region needed or optional)
+                 # Check S3 documentation or common practice. Using the format without region is often safe.
+                 video_url = f"https://{bucket}.s3.amazonaws.com/{safe_object_name}"
+                 # Alternate: f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{safe_object_name}"
+            else:
+                 video_url = f"https://{bucket}.s3.{region_segment}.amazonaws.com/{safe_object_name}"
 
         st.success(f"✔️ Video uploaded to S3: {object_name}")
         st.write(f"🔗 S3 URL: {video_url}")
@@ -3282,13 +3356,14 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                         # --- 5. Construct Unique S3 Filename ---
                         safe_topic = urllib.parse.quote(topic.replace(' ', '_')[:30], safe='')
                         timestamp = int(datetime.datetime.now().timestamp())
-                        final_s3_object_name = f"final_{safe_topic}_{lang}_copy{copy_num}_{timestamp}_base_{base_video_direct_url}.mp4"
+                        base_video_slug = urllib.parse.quote(base_video_direct_url, safe='')
+                        final_s3_object_name = f"{S3_VIDSLIDE_PREFIX}/final_{safe_topic}_{lang}_copy{copy_num}_{timestamp}_base_{base_video_slug}.mp4"
                         # --- 6. Upload to S3 ---
                         st.write(f"4/5: Uploading '{final_s3_object_name}' to S3...")
                         s3_url = upload_vid_to_s3(
                             s3_cli=s3_client, video_path=final_video_path,
                             bucket_name=s3_bucket_name, object_name=final_s3_object_name,
-                            region_name=s3_region
+                            region_name=s3_region, endpoint_url=s3_endpoint_url
                         )
                         if not s3_url: raise ValueError("Failed to upload video to S3.")
 
