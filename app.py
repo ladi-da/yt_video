@@ -143,7 +143,7 @@ SCRIPT_VER_OPTIONS =create_combos(["default", "default_v2", "1st_person" ])
 BG_VER_OPTIONS =[ False,"sunrise","funk","ukulele", "mix"]
 TTS_VOICE_OPTIONS = create_combos(['sage','redneck','announcer','sage uk','announcer uk'])
 # Consistent Backblaze path for generated creatives
-S3_VIDSLIDE_PREFIX = "creative-cloud/vidslide"
+S3_VIDSLIDE_PREFIX = "creative-cloud/yt-video"
 # --- Load Secrets ---
 s3_endpoint_url = st.secrets.get("S3_ENDPOINT_URL")
 try:
