@@ -139,7 +139,7 @@ SUBTITLE_WORDS_PER_GROUP = 2 # Group words for subtitles
 SUBTITLE_COLOR = '#FFFF00' # Yellow
 SUBTITLE_BG_COLOR = 'rgba(0, 0, 0, 0.6)' # Semi-transparent black
 st.set_page_config(layout="wide", page_title="YouTube Video Generator", page_icon="🎥")
-SCRIPT_VER_OPTIONS =create_combos(["default", "default_v2", "1st_person" ])
+SCRIPT_VER_OPTIONS =create_combos(["default", "default_v2", "1st_person","default_clean" ])
 BG_VER_OPTIONS =[ False,"sunrise","funk","ukulele", "mix"]
 TTS_VOICE_OPTIONS = create_combos(['sage','redneck','announcer','sage uk','announcer uk'])
 # Consistent Backblaze path for generated creatives
@@ -2167,7 +2167,7 @@ def sync_search_data():
             current_df = st.session_state.search_data_snapshot.copy()
         else:
             # Fallback: use current state, but this might contain unsynced changes
-            current_df = st.session_state.search_data.copy() if isinstance(st.session_state.search_data, pd.DataFrame) else pd.DataFrame([{'Topic': '', 'Language': 'English','Search Term': '',  "Script Angle": "default", 'Video Results': 5, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}])
+            current_df = st.session_state.search_data.copy() if isinstance(st.session_state.search_data, pd.DataFrame) else pd.DataFrame([{'Topic': '', 'Language': 'English','Search Term': '',  "Script Angle": "default_clean", 'Video Results': 5, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}])
 
         # Apply deletions first (indices are based on the snapshot)
         valid_delete_indices = sorted([idx for idx in deleted_rows if idx < len(current_df)], reverse=True)
@@ -2224,7 +2224,7 @@ def sync_search_data():
         for col in expected_cols: # Ensure all columns exist
              if col not in current_df.columns:
                   if col == "Language": current_df[col] = "English"
-                  elif col == "Script Angle": current_df[col] = "default"
+                  elif col == "Script Angle": current_df[col] = "default_clean"
                   elif col == "Video Results": current_df[col] = 5
                   else: current_df[col] = ""
         current_df = current_df[expected_cols] # Enforce column order
@@ -2237,7 +2237,7 @@ def sync_search_data():
         current_df['Topic'] = current_df['Topic'].fillna('').astype(str).str.strip()
         current_df['Search Term'] = current_df['Search Term'].fillna('').astype(str).str.strip()
         current_df['Language'] = current_df['Language'].fillna('English').astype(str).str.strip()
-        current_df['Script Angle'] = current_df['Script Angle'].fillna('default').astype(str).str.strip()
+        current_df['Script Angle'] = current_df['Script Angle'].fillna('default_clean').astype(str).str.strip()
 
         # Ensure 'Script Angle' values are valid options
         # current_df['Script Angle'] = current_df['Script Angle'].apply(lambda x: x if x in SCRIPT_VER_OPTIONS else 'default')
@@ -2250,7 +2250,7 @@ def sync_search_data():
 
         # If empty after filtering, add back a default row
         if current_df.empty:
-             current_df = pd.DataFrame([{'Topic': '',  'Language': 'English','Search Term': '', "Script Angle": "default", 'Video Results': 5, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}])
+             current_df = pd.DataFrame([{'Topic': '',  'Language': 'English','Search Term': '', "Script Angle": "default_clean", 'Video Results': 5, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}])
 
         # Update the main session state and create a fresh snapshot
         st.session_state.search_data = current_df.reset_index(drop=True)
@@ -2262,7 +2262,7 @@ def sync_search_data():
          if 'search_data_snapshot' in st.session_state:
               st.session_state.search_data = st.session_state.search_data_snapshot.copy()
          else: # If snapshot missing too, hard reset
-              st.session_state.search_data = pd.DataFrame([{'Topic': '',  'Language': 'English','Search Term': '', "Script Angle": "default", 'Video Results': 5, 'BG Music' : False, 'TTS Voice': 'sage'}])
+              st.session_state.search_data = pd.DataFrame([{'Topic': '',  'Language': 'English','Search Term': '', "Script Angle": "default_clean", 'Video Results': 5, 'BG Music' : False, 'TTS Voice': 'sage'}])
               st.session_state.search_data_snapshot = st.session_state.search_data.copy()
 
 
@@ -2292,7 +2292,7 @@ if 'api_search_results' not in st.session_state:
 # Input DataFrame for search terms and topics
 if 'search_data' not in st.session_state:
     st.session_state.search_data = pd.DataFrame([
-        {'Topic': 'sofa sale', 'Language': 'English','Search Term': 'auto',  "Script Angle": "default", 'Video Results': 40, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}
+        {'Topic': 'sofa sale', 'Language': 'English','Search Term': 'auto',  "Script Angle": "default_clean", 'Video Results': 40, 'BG Music' : "sunrise", 'TTS Voice': 'sage'}
     ])
 # Snapshot for data editor comparison
 if 'search_data_snapshot' not in st.session_state:
@@ -2324,7 +2324,7 @@ st.session_state.search_data_snapshot = st.session_state.search_data.copy()
 edited_df = st.sidebar.data_editor(
     st.session_state.search_data, # Use the main state data
     column_config={
-        "Script Angle": st.column_config.SelectboxColumn("Script Angle", options=SCRIPT_VER_OPTIONS, default="default", required=True),
+        "Script Angle": st.column_config.SelectboxColumn("Script Angle", options=SCRIPT_VER_OPTIONS, default="default_clean", required=True),
         "Video Results": st.column_config.NumberColumn("Video Results", min_value=0, max_value=100, step=1, default=5, required=True),
         "Language": st.column_config.TextColumn("Language", default="English", required=True),
         "Topic": st.column_config.TextColumn("Topic"),
@@ -2364,7 +2364,7 @@ if clear_button:
     st.session_state.batch_total_count = 0
     st.session_state.batch_processed_count = 0
     st.session_state.resolved_vid_urls = {}
-    st.session_state.search_data = pd.DataFrame([{'Topic': '','Language' : 'English', 'Search Term': '',"Script Angle" : "default", 'Video Results': 5}])
+    st.session_state.search_data = pd.DataFrame([{'Topic': '','Language' : 'English', 'Search Term': '',"Script Angle" : "default_clean", 'Video Results': 5}])
     st.session_state.search_data_snapshot = st.session_state.search_data.copy()
     # Clear the editor state explicitly if possible (might require widget key manipulation - complex)
     # For now, resetting search_data and rerunning should clear the editor visually.
@@ -3314,6 +3314,10 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                         elif script_ver_temp == "default":
                             script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 15-20 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action 'tap to....'  .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT dont use senetional words and phrasing and DONT make false promises , use Urgency Language, Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our". end with CTA in the likes of: 'Click to explore options or 'Tap to see how it works.'  or similar!!!!  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'. in end if video use something "Tap now to.." with a clear, non-committal phrase !!! NO ('get approved') 'See what's available near you' ' 'available this weekend\month' etc!!!  """
                         # script_text = chatGPT(script_prompt,model="o1", client=openai_client)
+                        elif script_ver_temp == "default_clean":
+                            script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 15-20 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action 'Read More about .. '   .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT dont use senetional words and phrasing and DONT make false promises , use Urgency Language, Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our".  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'.  \n  NO 'get approved', 'See what's available near you' ', 'available this' weekend\month'  promises claims deals . .no Urgency\miracle phrasing etc!!!  """
+                        # script_text = chatGPT(script_prompt,model="o1", client=openai_client)
+
 
                         elif script_ver_temp == '1st_person':
                             script_prompt = f"""
