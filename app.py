@@ -19,6 +19,8 @@ import anthropic # Make sure anthropic client is installed: pip install anthropi
 import moviepy.audio.fx.all as afx
 from google import genai
 import itertools
+import hashlib
+import re
 # Ensure MoviePy is installed: pip install moviepy
 # Ensure Pillow is installed: pip install Pillow
 # Ensure pydub is installed: pip install pydub
@@ -2037,6 +2039,30 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
         st.write("🧹 Cleanup finished.")
 
 
+# --- Helper: S3-safe slug builders ---
+def _slugify_for_s3(value, max_length=80):
+    """Convert arbitrary text into a URL-safe, S3-friendly slug."""
+    text = re.sub(r"[^\w.-]+", "_", str(value))
+    text = re.sub(r"_+", "_", text).strip("._")
+    if not text:
+        text = "item"
+    return text[:max_length]
+
+
+def make_source_slug(base_url):
+    """Create a short, readable slug for the source video URL with a hash suffix."""
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+        netloc_part = _slugify_for_s3(parsed.netloc.split(":")[0], max_length=25)
+        path_leaf = _slugify_for_s3(parsed.path.rstrip("/").split("/")[-1], max_length=30)
+        prefix = "_".join([part for part in (netloc_part, path_leaf) if part]).strip("_")
+        hash_suffix = hashlib.sha1(base_url.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        slug = f"{prefix}_{hash_suffix}" if prefix else hash_suffix
+        return slug[:80]
+    except Exception:
+        return hashlib.sha1(str(base_url).encode("utf-8", errors="ignore")).hexdigest()[:10]
+
+
 # --- Helper Function: Upload Video to S3 ---
 def upload_pil_image_to_s3(
     image,
@@ -2090,7 +2116,7 @@ def upload_pil_image_to_s3(
         st.error(f"S3 image upload failed: {e}", icon="🖼️")
         return None
 
-    safe_object_name = urllib.parse.quote(object_key, safe="/")
+    safe_object_name = urllib.parse.quote(object_key, safe="/%")
     if clean_endpoint:
         return f"{clean_endpoint.rstrip('/')}/{bucket}/{safe_object_name}"
     region_segment = clean_region or "us-east-1"
@@ -2127,7 +2153,7 @@ def upload_vid_to_s3(s3_cli, video_path, bucket_name, object_name, region_name, 
             )
 
         # Construct the S3 URL (ensure object_name is URL-encoded)
-        safe_object_name = urllib.parse.quote(object_key, safe="/")
+        safe_object_name = urllib.parse.quote(object_key, safe="/%")
         if clean_endpoint:
             video_url = f"{clean_endpoint.rstrip('/')}/{bucket}/{safe_object_name}"
         else:
@@ -3236,7 +3262,7 @@ if st.session_state.batch_processing_active and st.session_state.generation_queu
                         bg_music = video_data.get('BG Music', False)
                         tts_voice = video_data.get('TTS Voice', 'sage')
                         base_video_direct_url = video_data.get("Direct URL") # Use the fetched direct URL
-                        copy_num = video_data.get('Copy Number', 0),
+                        copy_num = video_data.get('Copy Number', 0)
                         platform = video_data.get('platform' , "na")
 
                         if not base_video_direct_url:
@@ -3315,7 +3341,7 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                             script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 10-13 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action 'tap to....'  .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT dont use senetional words and phrasing and DONT make false promises , use Urgency Language, Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our". end with CTA in the likes of: 'Click to explore options or 'Tap to see how it works.'  or similar!!!!  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'. in end if video use something "Tap now to.." with a clear, non-committal phrase !!! NO ('get approved') 'See what's available near you' ' 'available this weekend\month' etc!!!  """
                         # script_text = chatGPT(script_prompt,model="o1", client=openai_client)
                         elif script_ver_temp == "default_clean":
-                            script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 10-13 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action in appropriate lang in the likes: 'Read More about .. ' or 'Get the insight'  .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT  use senetional words and phrasing and DONT make false promises , dont use Urgency Language like 'today' or 'immediately',  Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our".  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'.\nThe ad must describe the article (the guide/tips), not the service (the loan/job/bike), Treat the user as a reader
+                            script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 10-13 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action in appropriate lang in the likes: 'Read More about .. ' or 'Get the insight' 'Here's what we found'  .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT  use senetional words and phrasing and DONT make false promises , dont use Urgency Language like 'today' or 'immediately',  Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our".  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'.\nThe ad must describe the article (the guide/tips), not the service (the loan/job/bike), Treat the user as a reader
                                 \n dont use words like 'options' 'opportunities' 'this' 'these' 'affordable' 'completly' \n  NO 'get approved', 'See what's available near you' ', 'available this' weekend\month'  promises claims deals . .no Urgency\miracle phrasing etc!!!  but still find a way to be eye catching captivating within above guidelines!!"""
                         # script_text = chatGPT(script_prompt,model="o1", client=openai_client)
 
@@ -3395,10 +3421,12 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                         if not final_video_path: raise ValueError("Video processing (MoviePy) failed.")
 
                         # --- 5. Construct Unique S3 Filename ---
-                        safe_topic = urllib.parse.quote(topic.replace(' ', '_')[:30], safe='')
+                        safe_topic = _slugify_for_s3(topic.replace(' ', '_'), max_length=40)
+                        safe_lang = _slugify_for_s3(lang, max_length=15)
+                        safe_copy_num = _slugify_for_s3(copy_num, max_length=6)
                         timestamp = int(datetime.datetime.now().timestamp())
-                        base_video_slug = urllib.parse.quote(base_video_direct_url, safe='')
-                        final_s3_object_name = f"{S3_VIDSLIDE_PREFIX}/final_{safe_topic}_{lang}_copy{copy_num}_{timestamp}_base_{base_video_slug}.mp4"
+                        source_slug = make_source_slug(base_video_direct_url)
+                        final_s3_object_name = f"{S3_VIDSLIDE_PREFIX}/final_{safe_topic}_{safe_lang}_copy{safe_copy_num}_{timestamp}_{source_slug}.mp4"
                         # --- 6. Upload to S3 ---
                         st.write(f"4/5: Uploading '{final_s3_object_name}' to S3...")
                         s3_url = upload_vid_to_s3(
