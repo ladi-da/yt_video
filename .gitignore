@@ -1,3 +1,4 @@
 .streamlit/secrets.toml
 audio/.DS_Store
 .DS_Store
+/__pycache__
