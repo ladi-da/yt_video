@@ -2300,6 +2300,14 @@ def convert_df_to_csv(df):
     df.to_csv(output, index=False, encoding='utf-8')
     return output.getvalue()
 
+# --- Helper: Split caret-delimited topics ---
+def split_topics_field(topic_value):
+    """Splits a caret-delimited topic string into cleaned topic parts."""
+    if not isinstance(topic_value, str):
+        return []
+    parts = [t.strip() for t in topic_value.split('^') if t.strip()]
+    return parts if parts else []
+
 # <<< END: IMPORT STATEMENTS AND HELPER FUNCTIONS >>>
 
 
@@ -2343,6 +2351,7 @@ if 'resolved_vid_urls' not in st.session_state: st.session_state.resolved_vid_ur
 # --- Input Area (Sidebar) ---
 st.sidebar.header("Inputs & Actions")
 st.sidebar.write("Enter Search Terms and Topics:")
+st.sidebar.caption("Tip: separate multiple topics in one row with '^' to search each topic separately.")
 
 # Take snapshot *before* rendering the editor
 st.session_state.search_data_snapshot = st.session_state.search_data.copy()
@@ -2472,9 +2481,13 @@ if search_button: # This block runs when the button is clicked
          # Else: allow the single default empty row.
     # Check 'auto' term requires Topic?
     auto_rows = search_df[search_df['Search Term'].str.lower() == 'auto']
-    if not auto_rows.empty and (auto_rows['Topic'] == '').any():
-        st.sidebar.warning("Rows with 'auto' in 'Search Term' must have a non-empty 'Topic'.", icon="⚠️")
-        valid_input = False
+    if not auto_rows.empty:
+        for _, auto_row in auto_rows.iterrows():
+            topic_parts = split_topics_field(auto_row.get('Topic', ''))
+            if not topic_parts:
+                st.sidebar.warning("Rows with 'auto' in 'Search Term' must include at least one topic (use '^' to split multiple).", icon="⚠️")
+                valid_input = False
+                break
 
     if valid_input:
         st.sidebar.success("Input valid, proceeding with search.")
@@ -2489,46 +2502,55 @@ if st.session_state.search_triggered and 'current_search_df' in st.session_state
     search_df = st.session_state.current_search_df
     search_items = search_df.to_dict('records')
 
-    st.info(f"Searching API for {len(search_items)} topic/term row(s)...", icon="🔍")
-    progress_bar = st.progress(0)
-    status_text_api = st.empty()
-
-    api_error_occurred = False
-    results_cache = {} # Temp cache for *this* search run
-
-    platform_options_base = []
-    if is_youtube:
-        platform_options_base.append(('yt', "YouTube"))
-    if is_tiktok:
-        platform_options_base.append(('tk', "TikTok"))
-    if is_pinterest:
-        platform_options_base.append(('pin', "Pinterest"))
-
-    if not platform_options_base:
-        st.warning("Please select at least one platform before searching.", icon="⚠️")
+    if not search_items:
+        st.warning("No valid topics or search terms to run.", icon="⚠️")
         st.session_state.search_triggered = False
+        st.session_state.api_search_results = {}
     else:
-        for i, item in enumerate(search_items):
-            # Retrieve validated data from the DataFrame row
-            term = item['Search Term'] # Already stripped in sync
-            topic = item['Topic']     # Already stripped in sync
-            count = item['Video Results'] # Already int and clamped
-            lang = item['Language']   # Already stripped in sync
-            script_ver = item["Script Angle"] # Already stripped in sync
-            bg_music = item["BG Music"]
-            tts_voice = item["TTS Voice"]
-            og_term = term
+        st.info(f"Searching API for {len(search_items)} topic/term row(s)...", icon="🔍")
+        progress_bar = st.progress(0)
+        status_text_api = st.empty()
 
-            if count <= 0:
-                st.info(f"Skipping row {i+1} ('{topic}' / '{term}') because Video Results is set to 0.", icon="ℹ️")
-                continue
-            # Handle 'auto' search term generation
-            if term.lower() == 'auto':
-                if not topic: # Should be caught by earlier validation, but double-check
-                    st.warning(f"Skipping row {i+1}: 'auto' search term requires a Topic.", icon="⚠️")
+        api_error_occurred = False
+        results_cache = {} # Temp cache for *this* search run
+
+        platform_options_base = []
+        if is_youtube:
+            platform_options_base.append(('yt', "YouTube"))
+        if is_tiktok:
+            platform_options_base.append(('tk', "TikTok"))
+        if is_pinterest:
+            platform_options_base.append(('pin', "Pinterest"))
+
+        if not platform_options_base:
+            st.warning("Please select at least one platform before searching.", icon="⚠️")
+            st.session_state.search_triggered = False
+            st.session_state.api_search_results = {}
+        else:
+            total_searches = len(search_items)
+            for i, item in enumerate(search_items):
+                # Retrieve validated data from the DataFrame row
+                term = item['Search Term'] # Already stripped in sync
+                topic = item['Topic']     # Already stripped in sync
+                topic_parts = split_topics_field(topic)
+                topic_for_prompt = topic_parts[0] if topic_parts else topic
+                count = item['Video Results'] # Already int and clamped
+                lang = item['Language']   # Already stripped in sync
+                script_ver = item["Script Angle"] # Already stripped in sync
+                bg_music = item["BG Music"]
+                tts_voice = item["TTS Voice"]
+                og_term = term
+
+                if count <= 0:
+                    st.info(f"Skipping '{topic}' / '{term}' because Video Results is set to 0.", icon="ℹ️")
                     continue
-                status_text_api.text(f"Generating search terms for: '{topic}'...")
-                try:
+                # Handle 'auto' search term generation
+                if term.lower() == 'auto':
+                    if not topic: # Should be caught by earlier validation, but double-check
+                        st.warning("Skipping search: 'auto' search term requires a Topic.", icon="⚠️")
+                        continue
+                    status_text_api.text(f"Generating search terms for: '{topic}'...")
+                    try:
                     # --- Use the refined GPT prompt for search terms ---
                     # generated_term = chatGPT(f"""You are a viral video ad expert. I will give you a topic, and you will return the top 3 YouTube Shorts search terms that:
     
@@ -2610,12 +2632,12 @@ if st.session_state.search_triggered and 'current_search_df' in st.session_state
                     #                 model = "gemini-2.5-flash-preview-04-17"
                     #                 # client=openai_client
                     #                 ) 
-                    generated_term= chatGPT(f"""{AUTO_TERMS_PROMPT} {topic}""",model="gpt-5",client=openai_client) #, model ='gemini-2.5-flash-preview-04-17'
+                    generated_term= chatGPT(f"""{AUTO_TERMS_PROMPT} {topic_for_prompt}""",model="gpt-5",client=openai_client) #, model ='gemini-2.5-flash-preview-04-17'
                     if not generated_term:
                         st.warning(f"Failed to generate search terms for '{topic}'. Skipping.", icon="🤖")
                         continue
                     term = generated_term # Replace 'auto' with generated terms
-                    st.write(f"Generated terms for '{topic}': {term}")
+                    st.write(f"Generated terms for '{topic_for_prompt}': {term}")
                 except Exception as gpt_err:
                     st.error(f"Error generating search terms for '{topic}': {gpt_err}", icon="🤖")
                     continue
@@ -2707,20 +2729,20 @@ if st.session_state.search_triggered and 'current_search_df' in st.session_state
                     }
                 
                 time.sleep(0.1) # Brief pause
-    
+            
             if not platform_used:
                 st.warning("Please select at least one platform before searching.", icon="⚠️")
                 api_error_occurred = True
                 break
-    
+
             if api_error_occurred:
                 break
-    
-        progress_bar.progress((i + 1) / len(search_items))
 
-    status_text_api.text("API Search complete." if not api_error_occurred else "API Search halted due to error.")
-    st.session_state.api_search_results = results_cache # Update main cache
-    st.session_state.search_triggered = False # Reset trigger
+            progress_bar.progress((i + 1) / total_searches)
+
+        status_text_api.text("API Search complete." if not api_error_occurred else "API Search halted due to error.")
+        st.session_state.api_search_results = results_cache # Update main cache
+        st.session_state.search_triggered = False # Reset trigger
     # No st.rerun() here, let results display immediately
 
 
@@ -2909,38 +2931,42 @@ if st.session_state.api_search_results:
                                         langs_to_process = ["default"] # Fallback language
                                         st.warning("Could not parse languages for job, using default.")
 
-                                    for current_lang_for_job in langs_to_process:
-                                        base_key_prefix = f"{base_video_id}_{current_lang_for_job}_"
-                                        existing_copy_numbers = [
-                                            int(k[len(base_key_prefix):])
-                                            for k in st.session_state.selected_videos.keys()
-                                            if k.startswith(base_key_prefix) and k[len(base_key_prefix):].isdigit()
-                                        ]
-                                        next_copy_number = max(existing_copy_numbers) + 1 if existing_copy_numbers else 1
-                                        job_key = f"{base_key_prefix}{next_copy_number}"
+                                    topic_parts_for_jobs = split_topics_field(topic_for_group) or [topic_for_group]
 
-                                        st.session_state.selected_videos[job_key] = {
-                                            'Job Key': job_key,
-                                            'Search Term': current_search_terms_for_group_display, # Terms used for this result set
-                                            'Topic': topic_for_group,
-                                            'Language': current_lang_for_job, # Specific language for this job
-                                            'Video Title': video_title,
-                                            'Video ID': base_video_id,
-                                            'Copy Number': next_copy_number,
-                                            'Standard URL': standard_video_url,
-                                            'fetching_dlp': True,
-                                            'Direct URL': None,
-                                            'Format Details': None,
-                                            'yt_dlp_error': None,
-                                            'Generated S3 URL': None,
-                                            'Generation Error': None,
-                                            'Status': 'Selected, Fetching URL...',
-                                            'Script Angle': script_ver_for_group, # Use script_ver_for_group
-                                            'BG Music' : bg_music_for_group,    # Use bg_music_for_group
-                                            'TTS Voice' : tts_voice_for_group,   # Use tts_voice_for_group
-                                            'platform' :platform
-                                        }
-                                        st.toast(f"Queued Job #{next_copy_number} ({current_lang_for_job}) for: {video_title}", icon="➕")
+                                    for topic_part_for_job in topic_parts_for_jobs:
+                                        topic_slug = _slugify_for_s3(topic_part_for_job, max_length=30)
+                                        for current_lang_for_job in langs_to_process:
+                                            base_key_prefix = f"{base_video_id}_{topic_slug}_{current_lang_for_job}_"
+                                            existing_copy_numbers = [
+                                                int(k[len(base_key_prefix):])
+                                                for k in st.session_state.selected_videos.keys()
+                                                if k.startswith(base_key_prefix) and k[len(base_key_prefix):].isdigit()
+                                            ]
+                                            next_copy_number = max(existing_copy_numbers) + 1 if existing_copy_numbers else 1
+                                            job_key = f"{base_key_prefix}{next_copy_number}"
+
+                                            st.session_state.selected_videos[job_key] = {
+                                                'Job Key': job_key,
+                                                'Search Term': current_search_terms_for_group_display, # Terms used for this result set
+                                                'Topic': topic_part_for_job,
+                                                'Language': current_lang_for_job, # Specific language for this job
+                                                'Video Title': video_title,
+                                                'Video ID': base_video_id,
+                                                'Copy Number': next_copy_number,
+                                                'Standard URL': standard_video_url,
+                                                'fetching_dlp': True,
+                                                'Direct URL': None,
+                                                'Format Details': None,
+                                                'yt_dlp_error': None,
+                                                'Generated S3 URL': None,
+                                                'Generation Error': None,
+                                                'Status': 'Selected, Fetching URL...',
+                                                'Script Angle': script_ver_for_group, # Use script_ver_for_group
+                                                'BG Music' : bg_music_for_group,    # Use bg_music_for_group
+                                                'TTS Voice' : tts_voice_for_group,   # Use tts_voice_for_group
+                                                'platform' :platform
+                                            }
+                                            st.toast(f"Queued Job #{next_copy_number} ({current_lang_for_job}) for topic '{topic_part_for_job}'", icon="➕")
                                     st.rerun()
 
                                 # --- Display Status for Existing Jobs for THIS video ---
