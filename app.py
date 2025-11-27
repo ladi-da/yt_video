@@ -1957,7 +1957,7 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
                         ocr_min_confidence=retry_conf,
                         ocr_y_start_ratio=0.05,
                         ocr_padding=20,
-                        blur_kernel_size=(33, 33),
+                        blur_kernel_size=(42, 42),
                         debug_save_frames=False
                     )
                     if res_success_retry and res_blurred_retry:
