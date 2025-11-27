@@ -270,6 +270,10 @@ def blur_subtitles_in_video_unified(
     Pytesseract to find subtitle-like boxes. If any text box is found in any group,
     the aggregated bounding box is blurred across the entire video. Saves the processed
     video to output_path.
+
+    Returns:
+        tuple(bool, bool): (success, blur_applied). success indicates the video was processed
+        and written; blur_applied indicates a bbox was found and blur actually applied.
     """
 
     # --- Nested Helper Function: Determine Subtitle Bounding Box ---
@@ -359,11 +363,11 @@ def blur_subtitles_in_video_unified(
     # --- Main logic of blur_subtitles_in_video_unified ---
     if not os.path.exists(video_path):
         logging.error(f"BLUR_FUNC: Input video not found: '{video_path}'")
-        return False # Indicate failure
+        return (False, False) # Indicate failure, no blur
 
     if video_path == output_path:
         logging.error(f"BLUR_FUNC: Input path and output path cannot be the same: '{video_path}'")
-        return False # Indicate failure
+        return (False, False) # Indicate failure, no blur
 
     original_pytesseract_cmd = pytesseract.pytesseract.tesseract_cmd
     tesseract_path_was_set = False
@@ -446,7 +450,7 @@ def blur_subtitles_in_video_unified(
 
         if not group_bboxes:
             logging.warning("BLUR_FUNC: No subtitle bbox detected in any frame group. Skipping blur.")
-            return False
+            return (False, False)
 
         all_boxes = list(group_bboxes.values())
         agg_min_x = min(b[0] for b in all_boxes)
@@ -496,11 +500,11 @@ def blur_subtitles_in_video_unified(
             ffmpeg_params=ffmpeg_params_list
         )
         logging.info(f"BLUR_FUNC: Successfully processed and saved blurred video to: {output_path}")
-        return True # Indicate success
+        return (True, True) # success, blur applied
 
     except Exception as e:
         logging.error(f"BLUR_FUNC: Error during video blurring for '{video_path}': {e}", exc_info=True)
-        return False # Indicate failure
+        return (False, False) # Indicate failure
     finally:
         if clip:
             try: clip.close()
@@ -1930,7 +1934,7 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
 
                 st.text("blur_subtitles_in_video_unified")
                 blur_conf = 55
-                res = blur_subtitles_in_video_unified(
+                res_success, res_blurred = blur_subtitles_in_video_unified(
                     preblur_video_path,
                     blurred_vid_path,
                     frames_per_group=10,
@@ -1940,12 +1944,13 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
                     blur_kernel_size=(33, 33),
                     debug_save_frames=False
                 )
-                if not res:
+                final_blur_applied = res_success and res_blurred
+                if not final_blur_applied:
                     retry_conf = max(0, blur_conf - 10)
                     st.write(f"🔎 No captions detected at {blur_conf}. Retrying blur at {retry_conf}...")
                     with tempfile.NamedTemporaryFile(delete=False, suffix="_blurred_retry.mp4") as tmp_blur_file_retry:
                         blurred_vid_path_retry = tmp_blur_file_retry.name
-                    res = blur_subtitles_in_video_unified(
+                    res_success_retry, res_blurred_retry = blur_subtitles_in_video_unified(
                         preblur_video_path,
                         blurred_vid_path_retry,
                         frames_per_group=10,
@@ -1955,13 +1960,14 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
                         blur_kernel_size=(33, 33),
                         debug_save_frames=False
                     )
-                    if res:
+                    if res_success_retry and res_blurred_retry:
                         # swap to retry path for downstream use/cleanup
                         blurred_vid_path = blurred_vid_path_retry
+                        final_blur_applied = True
                     else:
                         try: os.remove(blurred_vid_path_retry)
                         except Exception: pass
-                if res:
+                if final_blur_applied:
                     try:
                         processed_video.close()
                     except Exception:
