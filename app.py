@@ -21,6 +21,7 @@ from google import genai
 import itertools
 import hashlib
 import re
+import unicodedata
 # Ensure MoviePy is installed: pip install moviepy
 # Ensure Pillow is installed: pip install Pillow
 # Ensure pydub is installed: pip install pydub
@@ -256,7 +257,7 @@ def google_sheets_append_df(spreadsheet_id,range_name, df_data_input ):
 def blur_subtitles_in_video_unified(
     video_path,
     output_path, # This MUST be different from video_path
-    sample_time_sec=5.0,
+    frames_per_group=10,
     ocr_min_confidence=40,
     ocr_y_start_ratio=0.70,
     ocr_padding=15,
@@ -265,9 +266,10 @@ def blur_subtitles_in_video_unified(
     debug_save_frames=False
 ):
     """
-    Loads a video, determines a subtitle bounding box from a sample frame using
-    Pytesseract, and then blurs this region throughout the video.
-    Saves the processed video to output_path.
+    Loads a video, slices frames into groups, samples one frame per group, and uses
+    Pytesseract to find subtitle-like boxes. If any text box is found in any group,
+    the aggregated bounding box is blurred across the entire video. Saves the processed
+    video to output_path.
     """
 
     # --- Nested Helper Function: Determine Subtitle Bounding Box ---
@@ -311,7 +313,7 @@ def blur_subtitles_in_video_unified(
             confidence = int(ocr_data['conf'][i])
             if confidence > min_confidence_local:
                 text = ocr_data['text'][i].strip()
-                if not text:
+                if not text or len(text) < 3:
                     continue
                 x, y, w, h = (
                     ocr_data['left'][i], ocr_data['top'][i],
@@ -384,56 +386,92 @@ def blur_subtitles_in_video_unified(
         logging.info(f"BLUR_FUNC: Loading video: {video_path}")
         clip = VideoFileClip(video_path)
 
-        # Ensure sample_time_sec is within video duration
-        valid_sample_time_sec = clip.duration - 0.1 if clip.duration > 0 else 0
-        sample_time_sec = min(sample_time_sec, valid_sample_time_sec)
-        sample_time_sec = max(0, sample_time_sec) # ensure non-negative
+        fps = clip.fps if clip.fps and clip.fps > 0 else 24
+        clip_duration = clip.duration or 0
+        frames_per_group = max(1, int(frames_per_group) if frames_per_group else 10)
+        total_frames = max(int(np.ceil(clip_duration * fps)), 1)
+        group_bboxes = {}
+        first_detection_frame_pil = None
 
-        logging.info(f"BLUR_FUNC: Extracting sample frame at {sample_time_sec:.2f}s...")
-        sample_frame_np = clip.get_frame(sample_time_sec)
-        sample_frame_pil = Image.fromarray(sample_frame_np)
-
-        if debug_save_frames:
-            try:
-                sample_frame_pil.save("debug_blur_sample_frame.png")
-                logging.info("BLUR_FUNC: Saved 'debug_blur_sample_frame.png'")
-            except Exception as e_save:
-                logging.warning(f"BLUR_FUNC: Could not save debug_blur_sample_frame.png: {e_save}")
-        
-        logging.info("BLUR_FUNC: Determining subtitle bounding box...")
-        subtitle_bbox = _determine_subtitle_bbox_from_frame(
-            sample_frame_pil, ocr_min_confidence, ocr_y_start_ratio, ocr_padding
+        logging.info(
+            f"BLUR_FUNC: Scanning {total_frames} frames (~{clip_duration:.2f}s) "
+            f"in groups of {frames_per_group} to detect subtitles."
         )
 
-        if subtitle_bbox is None:
-            logging.warning("BLUR_FUNC: Could not determine subtitle bbox. Blurring will not be applied.")
-            # If no bbox, we might just copy the original to output_path or return indication
-            # For now, let's assume we want to output the original if no blur region found.
-            # Or, simply return False and let caller handle it.
-            # A robust way is to copy the file if no processing happens:
-            # import shutil
-            # shutil.copy(video_path, output_path)
-            # logging.info(f"BLUR_FUNC: Copied original video to {output_path} as no blur region found.")
-            # return True # Indicate success (copying is success in this context)
-            # --- OR ---
-            return False # Indicate that blurring did not happen, let caller decide.
+        for group_start in range(0, total_frames, frames_per_group):
+            group_idx = group_start // frames_per_group
+            sample_frame_idx = min(group_start + frames_per_group // 2, total_frames - 1)
+            sample_time = sample_frame_idx / fps
+            if clip_duration:
+                sample_time = min(max(sample_time, 0), max(clip_duration - (1.0 / fps), 0))
 
-        if debug_save_frames:
             try:
-                frame_viz = np.array(sample_frame_pil.copy())
+                sample_frame_np = clip.get_frame(sample_time)
+            except Exception as frame_err:
+                logging.warning(f"BLUR_FUNC: Could not fetch frame at t={sample_time:.3f}s: {frame_err}")
+                continue
+
+            sample_frame_pil = Image.fromarray(sample_frame_np)
+
+            if debug_save_frames and group_idx == 0:
+                try:
+                    sample_frame_pil.save("debug_blur_sample_frame.png")
+                    logging.info("BLUR_FUNC: Saved 'debug_blur_sample_frame.png'")
+                except Exception as e_save:
+                    logging.warning(f"BLUR_FUNC: Could not save debug_blur_sample_frame.png: {e_save}")
+            
+            subtitle_bbox = _determine_subtitle_bbox_from_frame(
+                sample_frame_pil, ocr_min_confidence, ocr_y_start_ratio, ocr_padding
+            )
+
+            if subtitle_bbox is None:
+                continue
+
+            group_bboxes[group_idx] = subtitle_bbox
+            if first_detection_frame_pil is None:
+                first_detection_frame_pil = sample_frame_pil.copy()
+            logging.info(f"BLUR_FUNC: Found subtitle bbox for group {group_idx}: {subtitle_bbox}")
+
+            if debug_save_frames and group_idx == 0:
+                try:
+                    frame_viz = np.array(sample_frame_pil.copy())
+                    cv2.rectangle(frame_viz,
+                                  (int(subtitle_bbox[0]), int(subtitle_bbox[1])),
+                                  (int(subtitle_bbox[2]), int(subtitle_bbox[3])),
+                                  (0, 255, 0), 3)
+                    Image.fromarray(frame_viz).save("debug_blur_sample_frame_with_bbox.png")
+                    logging.info("BLUR_FUNC: Saved 'debug_blur_sample_frame_with_bbox.png'.")
+                except Exception as e_save_bbox:
+                    logging.warning(f"BLUR_FUNC: Could not save debug_blur_sample_frame_with_bbox.png: {e_save_bbox}")
+
+        if not group_bboxes:
+            logging.warning("BLUR_FUNC: No subtitle bbox detected in any frame group. Skipping blur.")
+            return False
+
+        all_boxes = list(group_bboxes.values())
+        agg_min_x = min(b[0] for b in all_boxes)
+        agg_min_y = min(b[1] for b in all_boxes)
+        agg_max_x = max(b[2] for b in all_boxes)
+        agg_max_y = max(b[3] for b in all_boxes)
+        aggregated_bbox = (agg_min_x, agg_min_y, agg_max_x, agg_max_y)
+        logging.info(f"BLUR_FUNC: Aggregated subtitle bounding box across video: {aggregated_bbox}")
+
+        if debug_save_frames and first_detection_frame_pil is not None:
+            try:
+                frame_viz = np.array(first_detection_frame_pil.copy())
                 cv2.rectangle(frame_viz,
-                              (int(subtitle_bbox[0]), int(subtitle_bbox[1])),
-                              (int(subtitle_bbox[2]), int(subtitle_bbox[3])),
-                              (0, 255, 0), 3)
-                Image.fromarray(frame_viz).save("debug_blur_sample_frame_with_bbox.png")
-                logging.info("BLUR_FUNC: Saved 'debug_blur_sample_frame_with_bbox.png'.")
+                              (int(aggregated_bbox[0]), int(aggregated_bbox[1])),
+                              (int(aggregated_bbox[2]), int(aggregated_bbox[3])),
+                              (255, 0, 0), 3)
+                Image.fromarray(frame_viz).save("debug_blur_aggregated_bbox.png")
+                logging.info("BLUR_FUNC: Saved 'debug_blur_aggregated_bbox.png'.")
             except Exception as e_save_bbox:
-                logging.warning(f"BLUR_FUNC: Could not save debug_blur_sample_frame_with_bbox.png: {e_save_bbox}")
+                logging.warning(f"BLUR_FUNC: Could not save debug_blur_aggregated_bbox.png: {e_save_bbox}")
 
         def _process_frame_for_moviepy(frame_np_moviepy):
-            return _blur_region_in_frame(frame_np_moviepy, subtitle_bbox, blur_kernel_size)
+            return _blur_region_in_frame(frame_np_moviepy, aggregated_bbox, blur_kernel_size)
 
-        logging.info("BLUR_FUNC: Applying blur to video frames...")
+        logging.info("BLUR_FUNC: Applying blur to entire video using aggregated bbox...")
         processed_clip = clip.fl_image(_process_frame_for_moviepy)
         
         output_dir = os.path.dirname(output_path)
@@ -1728,7 +1766,7 @@ def download_direct_url(url, suffix=".mp4"):
 
 
 # --- Helper Function: Process Video with TTS and Subtitles ---
-def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang, copy_num, with_music=False ,platform='yt'):
+def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang, copy_num, with_music=False ,platform='yt', blur_captions=False):
     """
     Loads video (using downloaded path), adds TTS audio, loops/trims, adds subtitles.
     Returns the path to the final processed temporary video file, or None on failure.
@@ -1743,6 +1781,8 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
     looped_video = None
     processed_video = None
     resized_base_video = None
+    preblur_video_path = None
+    blurred_vid_path = None
     clips_for_composite = []
     local_vid_path = None # To store the path of the downloaded base video
 
@@ -1764,7 +1804,6 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
             if not local_vid_path:
                 raise ValueError(f"Failed to download base video content from: {base_video_url}")
 
-            # 2. Load downloaded video with MoviePy
             st.write(f"➡️ Loading downloaded video: {local_vid_path}")
         elif platform in ('tk', 'pin'):
             # st.text('tk')
@@ -1773,43 +1812,15 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
             local_vid_path = download_with_ytdlp(base_video_url)
             if not local_vid_path:
                 raise ValueError(f"Failed to download base video content from: {base_video_url}")
-        # Ensure target_resolution is set for potential resizing during load
-        with tempfile.NamedTemporaryFile(delete=False, suffix="_blurred.mp4") as tmp_blur_file:
-            blurred_vid_path = tmp_blur_file.name
-        if is_blur:
-            try:
-                st.text("blur_subtitles_in_video_unified")
-                res = blur_subtitles_in_video_unified(
-                    local_vid_path,
-                    blurred_vid_path,
-                    sample_time_sec=3.0,
-                    ocr_min_confidence=10,
-                    ocr_y_start_ratio=0.05, # Adjust if subtitles are higher/lower
-                    ocr_padding=20,
-                    blur_kernel_size=(51, 51), # Stronger blur
-                    # tesseract_cmd_path=r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-                    debug_save_frames=True # Set to True to see intermediate images
-                )
-                if res:
-                    local_vid_path = blurred_vid_path
-            except Exception as e:
-                st.status(f"blur_subtitles_in_video_unified error: {e}")
-
-        base_video = VideoFileClip(local_vid_path, audio=False, target_resolution=(720, 1280))
-
-        video_duration = base_video.duration
-        w = int(base_video.w) if base_video.w else 720
-        h = int(base_video.h) if base_video.h else 1280
-        st.write(f"✔️ Base video loaded: {w}x{h}, Duration: {video_duration:.2f}s")
-
-        # 3. Load TTS Audio
+            # 2. Load downloaded video with MoviePy
+        # 2. Load TTS Audio
         st.write(f"⏳ Loading TTS audio...")
         tts_audio = AudioFileClip(audio_path)
         audio_duration = tts_audio.duration
         if audio_duration <= 0:
              raise ValueError("TTS Audio has zero or negative duration.")
 
-        # 4. Handle Background Music (Optional)
+        # 3. Handle Background Music (Optional)
         combined_audio = tts_audio # Default
         if with_music:
             try:
@@ -1844,40 +1855,127 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
                 st.warning(f"Could not load or process background music: {music_err}", icon="🎵")
         st.write(f"✔️ Audio loaded/prepared: Duration: {audio_duration:.2f}s")
 
-        # 5. Resize Video Frame (Force 9:16)
+        # 4. Load and prep base video
         target_w, target_h = 720, 1280
-        st.write(f"⏳ Resizing video to {target_w}x{target_h}...")
-        try:
-            # Use resize method for simplicity. Crop can be used for different framing.
-            resized_base_video = base_video.resize(newsize=(target_w, target_h))
-            st.write(f"✔️ Video resized.")
-        except Exception as resize_err:
-            st.warning(f"Could not resize video: {resize_err}. Using original.", icon="⚠️")
-            resized_base_video = base_video # Fallback
-            # Update target dimensions if fallback is used
-            # target_w, target_h = w, h # This might break subtitle positioning/compositing size
+        st.write(f"⏳ Loading base video (video-only): {local_vid_path}")
+        base_video = VideoFileClip(local_vid_path, audio=False)
 
-        # 6. Loop or Trim Video to Match Audio Duration
-        processed_video = resized_base_video # Start with the resized clip
-        if video_duration < audio_duration:
-            st.write(f"⏳ Looping video ({video_duration:.2f}s) to match audio ({audio_duration:.2f}s)...")
-            num_loops = int(np.ceil(audio_duration / video_duration))
-            # Create copies for concatenation
-            clips_to_loop = [resized_base_video.copy().set_start(i * video_duration).set_duration(video_duration) for i in range(num_loops)]
+        def _resize_and_center_crop(clip_in, tw, th):
+            """Resize to cover target, then center-crop to exact size to avoid letterboxing."""
+            if not clip_in or not clip_in.w or not clip_in.h:
+                return clip_in
+            scale = max(tw / clip_in.w, th / clip_in.h)
+            clip_scaled = clip_in.resize(scale)
+            x1 = max((clip_scaled.w - tw) / 2, 0)
+            y1 = max((clip_scaled.h - th) / 2, 0)
+            return clip_scaled.crop(x1=x1, y1=y1, x2=x1 + tw, y2=y1 + th)
+
+        video_duration = base_video.duration or 0
+        w = int(base_video.w) if base_video.w else target_w
+        h = int(base_video.h) if base_video.h else target_h
+        st.write(f"✔️ Base video loaded: {w}x{h}, Duration: {video_duration:.2f}s")
+
+        st.write(f"⏳ Resizing and center-cropping video to {target_w}x{target_h}...")
+        try:
+            resized_base_video = _resize_and_center_crop(base_video, target_w, target_h)
+            st.write(f"✔️ Video resized/cropped.")
+        except Exception as resize_err:
+            st.warning(f"Could not resize/crop video: {resize_err}. Using original.", icon="⚠️")
+            resized_base_video = base_video
+
+        # 5. Loop or Trim Video to Match Audio Duration (before blur)
+        processed_video = resized_base_video
+        effective_video_duration = processed_video.duration or video_duration or 0
+        if effective_video_duration < audio_duration and effective_video_duration > 0:
+            st.write(f"⏳ Looping video ({effective_video_duration:.2f}s) to match audio ({audio_duration:.2f}s)...")
+            num_loops = int(np.ceil(audio_duration / effective_video_duration))
+            clips_to_loop = [
+                processed_video.copy().set_start(i * effective_video_duration).set_duration(effective_video_duration)
+                for i in range(num_loops)
+            ]
             looped_video = concatenate_videoclips(clips_to_loop, method="compose")
-            processed_video = looped_video.set_duration(audio_duration) # Explicitly set final duration
+            processed_video = looped_video.set_duration(audio_duration)
             st.write(f"✔️ Video looped {num_loops} times.")
-        elif video_duration > audio_duration:
-            st.write(f"⏳ Trimming video ({video_duration:.2f}s) to match audio ({audio_duration:.2f}s)...")
-            processed_video = resized_base_video.subclip(0, audio_duration)
+        elif effective_video_duration > audio_duration:
+            st.write(f"⏳ Trimming video ({effective_video_duration:.2f}s) to match audio ({audio_duration:.2f}s)...")
+            processed_video = processed_video.subclip(0, audio_duration)
             st.write(f"✔️ Video trimmed.")
         else:
             st.write("✔️ Video duration matches audio duration.")
 
-        # Ensure the processed video has the correct duration set
         processed_video = processed_video.set_duration(audio_duration)
 
+        # 6. Optional blur AFTER trim/loop
+        preblur_video_path = None
+        blurred_vid_path = None
+        if blur_captions:
+            try:
+                st.write("⏳ Preparing trimmed clip for blurring...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix="_preblur.mp4") as tmp_preblur:
+                    preblur_video_path = tmp_preblur.name
+
+                tmp_fps = processed_video.fps if processed_video.fps and processed_video.fps > 0 else 24
+                processed_video.write_videofile(
+                    preblur_video_path,
+                    codec="libx264",
+                    audio=False,
+                    fps=tmp_fps,
+                    preset="medium",
+                    threads=os.cpu_count() or 4,
+                    logger='bar'
+                )
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix="_blurred.mp4") as tmp_blur_file:
+                    blurred_vid_path = tmp_blur_file.name
+
+                st.text("blur_subtitles_in_video_unified")
+                blur_conf = 55
+                res = blur_subtitles_in_video_unified(
+                    preblur_video_path,
+                    blurred_vid_path,
+                    frames_per_group=10,
+                    ocr_min_confidence=blur_conf,
+                    ocr_y_start_ratio=0.05,
+                    ocr_padding=20,
+                    blur_kernel_size=(33, 33),
+                    debug_save_frames=False
+                )
+                if not res:
+                    retry_conf = max(0, blur_conf - 10)
+                    st.write(f"🔎 No captions detected at {blur_conf}. Retrying blur at {retry_conf}...")
+                    with tempfile.NamedTemporaryFile(delete=False, suffix="_blurred_retry.mp4") as tmp_blur_file_retry:
+                        blurred_vid_path_retry = tmp_blur_file_retry.name
+                    res = blur_subtitles_in_video_unified(
+                        preblur_video_path,
+                        blurred_vid_path_retry,
+                        frames_per_group=10,
+                        ocr_min_confidence=retry_conf,
+                        ocr_y_start_ratio=0.05,
+                        ocr_padding=20,
+                        blur_kernel_size=(33, 33),
+                        debug_save_frames=False
+                    )
+                    if res:
+                        # swap to retry path for downstream use/cleanup
+                        blurred_vid_path = blurred_vid_path_retry
+                    else:
+                        try: os.remove(blurred_vid_path_retry)
+                        except Exception: pass
+                if res:
+                    try:
+                        processed_video.close()
+                    except Exception:
+                        pass
+                    processed_video = VideoFileClip(blurred_vid_path, audio=False)
+                    processed_video = _resize_and_center_crop(processed_video, target_w, target_h).set_duration(audio_duration)
+                    st.write("✔️ Applied blur to trimmed clip.")
+                else:
+                    st.warning("Blur detection failed; continuing without blur on trimmed clip.", icon="⚠️")
+            except Exception as e:
+                st.status(f"blur_subtitles_in_video_unified error: {e}")
+
         # 7. Set Audio
+        processed_video = _resize_and_center_crop(processed_video, target_w, target_h)
         final_video_clip = processed_video.set_audio(combined_audio)
 
 
@@ -2020,6 +2118,12 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
                   os.remove(local_vid_path)
                   # st.write(f"🧹 Deleted temp base video: {local_vid_path}") # Verbose log
              except Exception as rm_err: st.warning(f"Could not delete temp base video: {local_vid_path} ({rm_err})")
+        if preblur_video_path and os.path.exists(preblur_video_path):
+             try: os.remove(preblur_video_path)
+             except Exception as rm_pre: st.warning(f"Could not delete temp pre-blur video: {preblur_video_path} ({rm_pre})")
+        if blurred_vid_path and os.path.exists(blurred_vid_path):
+             try: os.remove(blurred_vid_path)
+             except Exception as rm_blur: st.warning(f"Could not delete temp blurred video: {blurred_vid_path} ({rm_blur})")
 
         # Delete the main output temp file only if an error occurred before returning path
         # If function succeeded, the caller is responsible for the returned path.
@@ -2041,11 +2145,15 @@ def process_video_with_tts(base_video_url, audio_path, word_timings, topic, lang
 
 # --- Helper: S3-safe slug builders ---
 def _slugify_for_s3(value, max_length=80):
-    """Convert arbitrary text into a URL-safe, S3-friendly slug."""
-    text = re.sub(r"[^\w.-]+", "_", str(value))
+    """Convert arbitrary text into a URL-safe, ASCII-only slug for S3 keys."""
+    # Strip accents/diacritics so languages like Polish won't leak non-ASCII into the key
+    normalized = unicodedata.normalize("NFKD", str(value))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^\w.-]+", "_", ascii_text)
     text = re.sub(r"_+", "_", text).strip("._")
     if not text:
-        text = "item"
+        # Fall back to a short hash if nothing remains after cleanup
+        text = hashlib.sha1(str(value).encode("utf-8", errors="ignore")).hexdigest()[:12]
     return text[:max_length]
 
 
@@ -2346,6 +2454,19 @@ if 'batch_processing_active' not in st.session_state: st.session_state.batch_pro
 if 'batch_total_count' not in st.session_state: st.session_state.batch_total_count = 0
 if 'batch_processed_count' not in st.session_state: st.session_state.batch_processed_count = 0
 if 'resolved_vid_urls' not in st.session_state: st.session_state.resolved_vid_urls = {}
+if 'equal_height_btn_css' not in st.session_state:
+    st.markdown(
+        """
+        <style>
+        /* Keep side-by-side select buttons aligned */
+        div[data-testid="column"] div.stButton>button {
+            min-height: 44px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    st.session_state.equal_height_btn_css = True
 
 
 # --- Input Area (Sidebar) ---
@@ -2388,7 +2509,6 @@ clear_button = col2.button("🧹 Clear All", use_container_width=True, type="sec
 is_youtube = col1.checkbox("YT") 
 is_tiktok = col1.checkbox("tk")
 is_pinterest = col1.checkbox("Pin")
-is_blur = col2.checkbox("Blur captions?")
 if clear_button:
     # Reset all relevant states
     st.session_state.selected_videos = {}
@@ -2563,101 +2683,101 @@ if st.session_state.search_triggered and 'current_search_df' in st.session_state
                         st.error(f"Error generating search terms for '{topic}': {gpt_err}", icon="🤖")
                         continue
     
-            platform_options = platform_options_base
-            platform_used = False
-            for platform_code, platform_label in platform_options:
-                platform_used = True
-                unique_search_key = f"{term}_{topic}_{lang}_{script_ver}_{platform_code}"
-                if unique_search_key in results_cache:
-                    continue
-    
-                status_text_api.text(f"Searching {platform_label} for: '{term}' (Topic: '{topic}')...")
-                videos = None
-                next_block_start_index = None
-    
-                if platform_code == 'yt':
-                    videos = search_youtube(youtube_api_key_secret, term, count)
-                elif platform_code == 'tk':
-                    videos_list, next_block_start_index = search_tiktok_links_google(
-                        api_keys=youtube_api_key_secret,
-                        cx_id=GOOGLE_TIKTOK_CX_ID,
-                        query=term,
-                        num_results=count,
-                        start_index=1
-                    )
-                    videos = videos_list
-                elif platform_code == 'pin':
-                    videos_list, next_block_start_index = search_pinterest_links_google(
-                        api_keys=youtube_api_key_secret,
-                        cx_id=GOOGLE_PINTEREST_CX_ID,
-                        query=term,
-                        num_results=count,
-                        start_index=1,
-                        # videos_only=pin_videos_only
-                    )
-                    videos = videos_list
-    
-                if videos is None:
-                     st.error(f"Stopping search due to critical API issue for {platform_label}.", icon="🚫")
-                     api_error_occurred = True
-                     break
-                if not videos:
-                     st.warning(f"No {platform_label} results for '{term}' (Topic: '{topic}'). Skipping this platform.", icon="⚠️")
-                     continue
+                platform_options = platform_options_base
+                platform_used = False
+                for platform_code, platform_label in platform_options:
+                    platform_used = True
+                    unique_search_key = f"{term}_{topic}_{lang}_{script_ver}_{platform_code}"
+                    if unique_search_key in results_cache:
+                        continue
 
-                if platform_code == 'yt':
-                    results_cache[unique_search_key] = {
-                        'videos': videos,
-                        'topic': topic,
-                        'lang': lang,
-                        "script_ver": script_ver,
-                        'original_term': term,
-                        'bg_music': bg_music,
-                        'original_input_count': count,
-                        'tts_voice': tts_voice,
-                        'input_search_term': og_term,
-                        'platform': 'yt'
-                    }
-                elif platform_code == 'tk':
-                    results_cache[unique_search_key] = {
-                        'videos': videos,
-                        'topic': topic,
-                        'lang': lang,
-                        "script_ver": script_ver,
-                        'original_term': term,
-                        'bg_music': bg_music,
-                        'original_input_count': count,
-                        'tts_voice': tts_voice,
-                        'input_search_term': og_term,
-                        'platform': 'tk',
-                        'next_start_index': next_block_start_index,
-                        'last_start_index': 1
-                    }
-                elif platform_code == 'pin':
-                    results_cache[unique_search_key] = {
-                        'videos': videos,
-                        'topic': topic,
-                        'lang': lang,
-                        "script_ver": script_ver,
-                        'original_term': term,
-                        'bg_music': bg_music,
-                        'original_input_count': count,
-                        'tts_voice': tts_voice,
-                        'input_search_term': og_term,
-                        'platform': 'pin',
-                        'next_start_index': next_block_start_index,
-                        'last_start_index': 1
-                    }
+                    status_text_api.text(f"Searching {platform_label} for: '{term}' (Topic: '{topic}')...")
+                    videos = None
+                    next_block_start_index = None
+
+                    if platform_code == 'yt':
+                        videos = search_youtube(youtube_api_key_secret, term, count)
+                    elif platform_code == 'tk':
+                        videos_list, next_block_start_index = search_tiktok_links_google(
+                            api_keys=youtube_api_key_secret,
+                            cx_id=GOOGLE_TIKTOK_CX_ID,
+                            query=term,
+                            num_results=count,
+                            start_index=1
+                        )
+                        videos = videos_list
+                    elif platform_code == 'pin':
+                        videos_list, next_block_start_index = search_pinterest_links_google(
+                            api_keys=youtube_api_key_secret,
+                            cx_id=GOOGLE_PINTEREST_CX_ID,
+                            query=term,
+                            num_results=count,
+                            start_index=1,
+                            # videos_only=pin_videos_only
+                        )
+                        videos = videos_list
+
+                    if videos is None:
+                         st.error(f"Stopping search due to critical API issue for {platform_label}.", icon="🚫")
+                         api_error_occurred = True
+                         break
+                    if not videos:
+                         st.warning(f"No {platform_label} results for '{term}' (Topic: '{topic}'). Skipping this platform.", icon="⚠️")
+                         continue
+
+                    if platform_code == 'yt':
+                        results_cache[unique_search_key] = {
+                            'videos': videos,
+                            'topic': topic,
+                            'lang': lang,
+                            "script_ver": script_ver,
+                            'original_term': term,
+                            'bg_music': bg_music,
+                            'original_input_count': count,
+                            'tts_voice': tts_voice,
+                            'input_search_term': og_term,
+                            'platform': 'yt'
+                        }
+                    elif platform_code == 'tk':
+                        results_cache[unique_search_key] = {
+                            'videos': videos,
+                            'topic': topic,
+                            'lang': lang,
+                            "script_ver": script_ver,
+                            'original_term': term,
+                            'bg_music': bg_music,
+                            'original_input_count': count,
+                            'tts_voice': tts_voice,
+                            'input_search_term': og_term,
+                            'platform': 'tk',
+                            'next_start_index': next_block_start_index,
+                            'last_start_index': 1
+                        }
+                    elif platform_code == 'pin':
+                        results_cache[unique_search_key] = {
+                            'videos': videos,
+                            'topic': topic,
+                            'lang': lang,
+                            "script_ver": script_ver,
+                            'original_term': term,
+                            'bg_music': bg_music,
+                            'original_input_count': count,
+                            'tts_voice': tts_voice,
+                            'input_search_term': og_term,
+                            'platform': 'pin',
+                            'next_start_index': next_block_start_index,
+                            'last_start_index': 1
+                        }
+                    
+                    time.sleep(0.1) # Brief pause
                 
-                time.sleep(0.1) # Brief pause
-            
-                if not platform_used:
-                    st.warning("Please select at least one platform before searching.", icon="⚠️")
-                    api_error_occurred = True
-                    break
+                    if not platform_used:
+                        st.warning("Please select at least one platform before searching.", icon="⚠️")
+                        api_error_occurred = True
+                        break
 
-                if api_error_occurred:
-                    break
+                    if api_error_occurred:
+                        break
 
                 progress_bar.progress((i + 1) / total_searches)
 
@@ -2844,7 +2964,7 @@ if st.session_state.api_search_results:
                                     st.session_state[show_video_key] = not st.session_state[show_video_key]
                                     st.rerun()
 
-                                if st.button("➕ Select (Queue Job)", key=f"select_btn_{grid_instance_key}", type="primary", use_container_width=True, disabled=st.session_state.batch_processing_active):
+                                def _queue_job(blur_captions=False):
                                     base_video_id = video_id
                                     base_lang_string = lang_for_group.strip() # Use lang_for_group
                                     langs_to_process = [l.strip() for l in base_lang_string.split(',') if l.strip()]
@@ -2885,9 +3005,19 @@ if st.session_state.api_search_results:
                                                 'Script Angle': script_ver_for_group, # Use script_ver_for_group
                                                 'BG Music' : bg_music_for_group,    # Use bg_music_for_group
                                                 'TTS Voice' : tts_voice_for_group,   # Use tts_voice_for_group
-                                                'platform' :platform
+                                                'platform' :platform,
+                                                'Blur Captions': blur_captions,
+                                                'Approved': False
                                             }
-                                            st.toast(f"Queued Job #{next_copy_number} ({current_lang_for_job}) for topic '{topic_part_for_job}'", icon="➕")
+                                            blur_note = " with blur" if blur_captions else ""
+                                            st.toast(f"Queued Job #{next_copy_number} ({current_lang_for_job}) for topic '{topic_part_for_job}'{blur_note}", icon="➕")
+
+                                btn_sel, btn_blur = st.columns(2)
+                                if btn_sel.button("➕ Select", key=f"select_btn_{grid_instance_key}", type="primary", use_container_width=True, disabled=st.session_state.batch_processing_active):
+                                    _queue_job(blur_captions=False)
+                                    st.rerun()
+                                if btn_blur.button("🌫️ Blur", key=f"select_blur_btn_{grid_instance_key}", type="primary", use_container_width=True, disabled=st.session_state.batch_processing_active):
+                                    _queue_job(blur_captions=True)
                                     st.rerun()
 
                                 # --- Display Status for Existing Jobs for THIS video ---
@@ -3288,7 +3418,7 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                             script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 10-13 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action 'tap to....'  .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT dont use senetional words and phrasing and DONT make false promises , use Urgency Language, Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our". end with CTA in the likes of: 'Click to explore options or 'Tap to see how it works.'  or similar!!!!  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'. in end if video use something "Tap now to.." with a clear, non-committal phrase !!! NO ('get approved') 'See what's available near you' ' 'available this weekend\month' etc!!!  """
                         # script_text = chatGPT(script_prompt,model="o1", client=openai_client)
                         elif script_ver_temp == "default_clean":
-                            script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 10-13 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action in appropriate lang in the likes: 'Read More about .. ' or 'Get the insight' 'Here's what we found'  .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT  use senetional words and phrasing and DONT make false promises , dont use Urgency Language like 'today' or 'immediately',  Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our".  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'.\nThe ad must describe the article (the guide/tips), not the service (the loan/job/bike), Treat the user as a reader
+                            script_prompt = f"""Create a short, engaging voiceover script for FB viral   video (roughly 10-13 seconds long, maybe 2-3 sentences) about '{topic}' in language {lang}. The tone should be informative yet conversational, '.  smooth flow. Just provide the script text, nothing else. create intriguing and engaging script, sell the topic to the audience . be very causal and not 'advertisement' style vibe. end with a call to action in appropriate lang in the likes: 'Read More about .. ' or 'Get the insight' 'Here's what we found'  .the text needs to be retentive.Don't say 'we' or 'our' .NOTE:: DO NOT  use senetional words and phrasing and DONT make false promises , dont use Urgency Language like 'today' or 'immediately' 'entirely' 'completly' 'Career' etc  ,  Avoid geographically suggestive terms (e.g., "Near you," "In your area"). Do not use "we" or "our".  but still highly engaging high CTR not generic and that pushes value and benefit to the viewer and convice to click . dont use 'to see models\what's available ... etc'.\nThe ad must describe the article (the guide/tips), not the service (the loan/job/bike), Treat the user as a reader
                                 \n dont use words like 'options' 'opportunities' 'this' 'these' 'affordable' 'completly' \n  NO 'get approved', 'See what's available near you' ', 'available this' weekend\month'  promises claims deals . .no Urgency\miracle phrasing etc!!!  but still find a way to be eye catching captivating within above guidelines!!"""
                         # script_text = chatGPT(script_prompt,model="o1", client=openai_client)
 
@@ -3350,6 +3480,7 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                         st.write(f"3/5: Processing base video & adding audio/subtitles...")
                         current_with_music = bg_music
                         if current_with_music == 'mix': current_with_music = random.choice(BG_VER_OPTIONS)
+                        blur_captions = video_data.get('Blur Captions', False)
 
                         # Pass Direct URL and other necessary data
                         # This function now downloads the direct url, processes, and returns temp output path
@@ -3363,7 +3494,8 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                             lang=lang,
                             copy_num=copy_num,
                             with_music=current_with_music,
-                            platform= platform
+                            platform= platform,
+                            blur_captions=blur_captions
                         )
                         if not final_video_path: raise ValueError("Video processing (MoviePy) failed.")
 
@@ -3390,6 +3522,8 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
                             st.session_state.selected_videos[job_key_to_process]['Generated S3 URL'] = s3_url
                             st.session_state.selected_videos[job_key_to_process]['Generation Error'] = None
                             st.session_state.selected_videos[job_key_to_process]['Status'] = 'Completed'
+                            if 'Approved' not in st.session_state.selected_videos[job_key_to_process]:
+                                st.session_state.selected_videos[job_key_to_process]['Approved'] = False
                             st.success(f"✅ Job '{job_key_to_process}' completed!", icon="🎉")
                             st.video(s3_url) # Show the final video
                         else: st.warning(f"Job key {job_key_to_process} missing after completion.")
@@ -3475,6 +3609,39 @@ NO ('get approved') 'See what's available near you' ' 'available this weekend\mo
 st.sidebar.divider()
 st.sidebar.header("Selected & Generated Video Jobs")
 
+def _format_job_option(job_key):
+    job = st.session_state.selected_videos.get(job_key, {})
+    title = job.get('Video Title', 'Untitled')
+    status = job.get('Status', 'Unknown')
+    lang = job.get('Language', '')
+    return f"{job_key} — {status} — {lang} — {title[:40]}"
+
+pending_job_keys = [
+    k for k, v in st.session_state.get('selected_videos', {}).items()
+    if v.get('Status') not in ('Completed',)
+]
+jobs_to_remove = st.sidebar.multiselect(
+    "Remove pending jobs",
+    options=pending_job_keys,
+    format_func=_format_job_option,
+    key="remove_jobs_multiselect"
+)
+remove_disabled = st.session_state.batch_processing_active or not jobs_to_remove
+if st.sidebar.button("🗑️ Remove Selected Jobs", use_container_width=True, disabled=remove_disabled):
+    for rm_key in jobs_to_remove:
+        st.session_state.selected_videos.pop(rm_key, None)
+    # Prune queue and adjust counts
+    st.session_state.generation_queue = [
+        k for k in st.session_state.generation_queue if k not in jobs_to_remove
+    ]
+    st.session_state.batch_total_count = len(st.session_state.generation_queue)
+    st.session_state.batch_processed_count = min(
+        st.session_state.batch_processed_count,
+        st.session_state.batch_total_count
+    )
+    st.toast(f"Removed {len(jobs_to_remove)} job(s) from queue", icon="🗑️")
+    st.rerun()
+
 if 'selected_videos' in st.session_state and st.session_state.selected_videos:
     selected_list = list(st.session_state.selected_videos.values())
     if selected_list:
@@ -3541,8 +3708,12 @@ if 'selected_videos' in st.session_state and st.session_state.selected_videos:
         input_reference_df = st.session_state.get('current_search_df')
         if input_reference_df is None or input_reference_df.empty:
             input_reference_df = st.session_state.get('search_data')
+        approved_jobs = {
+            k: v for k, v in st.session_state.selected_videos.items()
+            if v.get('Generated S3 URL') and v.get('Approved')
+        }
         df_topic_summary = create_topic_summary_dataframe(
-            st.session_state.selected_videos,
+            approved_jobs,
             input_reference_df
         )
 
@@ -3573,7 +3744,7 @@ if 'selected_videos' in st.session_state and st.session_state.selected_videos:
             except Exception as e:
                 st.sidebar.warning(f"Could not generate summary CSV: {e}")
         else:
-            st.sidebar.info("No videos successfully generated yet for summary.")
+            st.sidebar.info("No approved videos yet for summary.")
 
     else: # If selected_list is empty
          st.sidebar.info("No video jobs selected yet.")
@@ -3582,3 +3753,62 @@ else: # If selected_videos dict is empty or doesn't exist
 
 # Footer notes
 st.sidebar.caption("Each 'Select' click queues one job. URL Fetch after selection. Video Gen uses direct URL.")
+
+# --- Approval Grid (Main) ---
+st.divider()
+st.subheader("Pending Video Approvals")
+approval_items = [
+    (job_key, data) for job_key, data in st.session_state.get('selected_videos', {}).items()
+    if data.get('Generated S3 URL')
+]
+
+if approval_items:
+    # Group by Topic + Language to mirror summary rows
+    grouped = {}
+    for job_key, data in approval_items:
+        topic = data.get('Topic', 'Unknown Topic')
+        lang = data.get('Language', 'Unknown Lang')
+        group_key = f"{topic} — {lang}"
+        grouped.setdefault(group_key, []).append((job_key, data))
+
+    for group_key, items in grouped.items():
+        st.markdown(f"**{group_key}**")
+        cols = st.columns(min(3, len(items)))
+        for idx, (job_key, data) in enumerate(items):
+            col = cols[idx % len(cols)]
+            with col:
+                vid_url = data.get('Generated S3 URL')
+                safe_id = re.sub(r'[^a-zA-Z0-9_-]', '', f"vid_{job_key}")
+                if vid_url:
+                    st.markdown(
+                        f"""
+                        <video id="{safe_id}" src="{vid_url}" playsinline muted autoplay loop controls style="width:100%; border-radius:8px;"></video>
+                        <script>
+                        (() => {{
+                            const v=document.getElementById("{safe_id}");
+                            if(!v) return;
+                            v.defaultPlaybackRate=2.0;
+                            v.playbackRate=2.0;
+                            const applyRate=() => {{
+                                v.playbackRate=2.0;
+                            }};
+                            v.addEventListener('loadedmetadata', applyRate);
+                            v.addEventListener('loadeddata', applyRate);
+                            v.addEventListener('play', applyRate);
+                            v.play().catch(()=>{{}});
+                        }})();
+                        </script>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                is_approved = data.get('Approved', False)
+                btn_label = "✅ Approved" if is_approved else "✅ Approve"
+                btn_type = "secondary" if is_approved else "primary"
+                btn_disabled = False
+                if st.button(btn_label, key=f"approve_{job_key}", use_container_width=True, type=btn_type, disabled=btn_disabled):
+                    st.session_state.selected_videos[job_key]['Approved'] = True
+                    st.toast(f"Approved video for job {job_key}", icon="✅")
+                    st.rerun()
+        st.divider()
+else:
+    st.info("No pending videos to approve.")
