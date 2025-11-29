@@ -261,7 +261,7 @@ def blur_subtitles_in_video_unified(
     ocr_min_confidence=40,
     ocr_y_start_ratio=0.70,
     ocr_padding=15,
-    blur_kernel_size=(51, 51),
+    blur_kernel_size=(81, 81),
     tesseract_cmd_path=None,
     debug_save_frames=False
 ):
